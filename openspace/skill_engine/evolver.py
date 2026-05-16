@@ -145,6 +145,11 @@ class EvolutionContext:
     # Available tools for agent loop (read_file, web_search, shell, MCP, etc.)
     available_tools: List["BaseTool"] = field(default_factory=list)
 
+    # For CAPTURED: preferred directory to write the new skill.
+    # Set from the calling host agent's skill directory so captured skills
+    # are written back to the correct host, not always to _skill_dirs[0].
+    capture_dir: Optional[Path] = None
+
 
 class SkillEvolver:
     """Execute skill evolution actions.
@@ -259,13 +264,20 @@ class SkillEvolver:
 
     # Trigger 1: post-analysis
     async def process_analysis(
-        self, analysis: ExecutionAnalysis,
+        self,
+        analysis: ExecutionAnalysis,
+        capture_dir: Optional[Path] = None,
     ) -> List[SkillRecord]:
         """Process all evolution suggestions from a completed analysis.
 
         Called immediately after ``ExecutionAnalyzer.analyze_execution()``.
         Each suggestion becomes one evolution action, executed in parallel
         (throttled by semaphore).
+
+        Args:
+            analysis: The completed execution analysis.
+            capture_dir: Preferred directory for CAPTURED skills (host agent's
+                skill dir).  Falls back to ``registry._skill_dirs[0]`` when None.
         """
         if not analysis.candidate_for_evolution:
             return []
@@ -273,7 +285,9 @@ class SkillEvolver:
         # Build contexts first (cheap, no LLM calls)
         contexts: List[EvolutionContext] = []
         for suggestion in analysis.evolution_suggestions:
-            ctx = self._build_context_from_analysis(analysis, suggestion)
+            ctx = self._build_context_from_analysis(
+                analysis, suggestion, capture_dir=capture_dir,
+            )
             if ctx is not None:
                 contexts.append(ctx)
 
@@ -288,6 +302,8 @@ class SkillEvolver:
                 f"[Trigger:analysis] Evolved {len(results)} skill(s): {names} "
                 f"from task {analysis.task_id}"
             )
+
+        self._store.mark_evolution_processed(analysis.task_id)
         return results
 
     # Trigger 2: tool quality degradation
@@ -948,13 +964,23 @@ class SkillEvolver:
         new_content = _set_frontmatter_field(new_content, "name", new_name)
 
         # Create new skill directory via create_skill (handles multi-file FULL)
-        skill_dirs = self._registry._skill_dirs
-        if not skill_dirs:
-            logger.warning("CAPTURED: no skill directories configured")
-            return None
+        # Priority chain for choosing the target skill root:
+        #   1. ctx.capture_dir — explicitly set from host agent's skill_dirs param
+        #   2. Infer from analysis — if this task used a skill from dir B,
+        #      captured skills belong alongside it (same host agent context)
+        #   3. registry._skill_dirs[0] — ultimate fallback
+        base_dir: Optional[Path] = None
+        if ctx.capture_dir and ctx.capture_dir.is_dir():
+            base_dir = ctx.capture_dir
+        else:
+            base_dir = self._infer_capture_dir_from_analysis(ctx)
 
-        # Directory name always matches the skill name
-        base_dir = skill_dirs[0]  # Primary user skill directory
+        if base_dir is None:
+            skill_dirs = self._registry._skill_dirs
+            if not skill_dirs:
+                logger.warning("CAPTURED: no skill directories configured")
+                return None
+            base_dir = skill_dirs[0]
         target_dir = base_dir / new_name
         if target_dir.exists():
             new_name = f"{new_name}-{uuid.uuid4().hex[:6]}"
@@ -1015,6 +1041,45 @@ class SkillEvolver:
 
         logger.info(f"CAPTURED: {new_name} [{new_id}]")
         return new_record
+
+    def _infer_capture_dir_from_analysis(
+        self, ctx: EvolutionContext,
+    ) -> Optional[Path]:
+        """Infer the best skill root for a CAPTURED skill from analysis context.
+
+        When ``capture_dir`` is not explicitly set (no ``skill_dirs`` param
+        from the host agent), we look at which skills were used during the
+        task that triggered the capture.  If a used skill lives under one
+        of the registered skill roots, that root is a reasonable home for
+        the new captured skill (same host agent context).
+        """
+        if not ctx.recent_analyses:
+            return None
+
+        registry_roots = self._registry._skill_dirs
+        if not registry_roots:
+            return None
+
+        for analysis in ctx.recent_analyses:
+            for judgment in analysis.skill_judgments:
+                if not judgment.skill_applied:
+                    continue
+                rec = self._store.load_record(judgment.skill_id)
+                if not rec or not rec.path:
+                    continue
+                skill_path = Path(rec.path).parent  # e.g. /A/foo/
+                for root in registry_roots:
+                    try:
+                        skill_path.relative_to(root)
+                        logger.debug(
+                            "CAPTURED: inferred capture dir %s from "
+                            "applied skill %s", root, judgment.skill_id,
+                        )
+                        return root
+                    except ValueError:
+                        continue
+
+        return None
 
     async def _run_evolution_loop(
         self,
@@ -1362,13 +1427,15 @@ class SkillEvolver:
         self,
         analysis: ExecutionAnalysis,
         suggestion: EvolutionSuggestion,
+        capture_dir: Optional[Path] = None,
     ) -> Optional[EvolutionContext]:
         """Build EvolutionContext from a single analysis suggestion.
 
         Loads all target skills referenced by ``suggestion.target_skill_ids``.
         For FIX: exactly 1 parent required.
         For DERIVED: 1+ parents (multi-parent = merge).
-        For CAPTURED: parents list is empty.
+        For CAPTURED: parents list is empty; ``capture_dir`` controls where
+        the new skill is written (defaults to registry's first skill root).
         """
         records: List[SkillRecord] = []
         contents: List[str] = []
@@ -1412,6 +1479,7 @@ class SkillEvolver:
             source_task_id=analysis.task_id,
             recent_analyses=[analysis],
             available_tools=self._available_tools,
+            capture_dir=capture_dir,
         )
 
     def _load_skill_content(self, record: SkillRecord) -> str:

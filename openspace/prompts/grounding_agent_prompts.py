@@ -28,6 +28,17 @@ class GroundingAgentPrompts:
             "- If you need results to decide next action, wait for next iteration"
         )
 
+        sections.append(
+            "# On Tool Timeouts\n\n"
+            "When a tool returns a timeout result, the operation's outcome may be "
+            "incomplete or UNKNOWN unless the result explicitly says the process "
+            "was killed.\n"
+            "- Do NOT call the same tool with the same arguments twice in this task.\n"
+            "- Treat the task as paused-pending-investigation, not failed-and-retry.\n"
+            "- Report the timeout to the user and stop so they can decide whether "
+            "to investigate, kill orphaned work, or retry with adjusted parameters."
+        )
+
         # Tool Selection Tips (only mention backends that exist)
         tips: List[str] = []
         has_mcp = "mcp" in scope

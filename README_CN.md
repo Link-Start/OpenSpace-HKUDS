@@ -25,6 +25,13 @@
 
 ## 📢 最新动态
 
+- **2026-04-16** 📊 **进化候选生命周期追踪** — skill store 新增 `evolution_processed_at` 字段，清晰区分待处理与已处理的进化候选记录。
+- **2026-04-12** 🍎 **macOS 平台加固** — 将 `atomacos` 从核心 macOS 导入中解耦，截图、窗口控制、录屏等功能无需 atomacos 即可独立运行。
+- **2026-04-10** 🎯 **CAPTURED skills** 现已正确持久化到宿主 Agent 自身的 skill 目录，而非默认注册路径。云端 skill 上传现已正确支持**私有可见性**。
+- **2026-04-09** 💬 多渠道**通信网关**上线。OpenSpace 现可接收并回复外部平台消息。内置 **WhatsApp**（Baileys bridge + 扫码认证）与**飞书**（HTTP webhook）适配器，支持会话管理、附件缓存和白名单访问控制。配置方式见 [`openspace/config/README.md`](openspace/config/README.md)。
+- **2026-04-07** 🌐 OpenSpace MCP 新增独立 **SSE** 与 **streamable HTTP** 启动方式，便于远端 host 通过 HTTP 接入，绕过基于 stdio 的 MCP server timeout 瓶颈。具体接入方式见 [host integration 文档](openspace/host_skills/README.md)。
+- **2026-04-06** 🛠️ 修复多项运行时问题，覆盖 grounding、MCP 服务、skill 进化与持久化链路，长流程执行的稳定性与恢复能力进一步提升。
+- **2026-04-05** 🧭 LLM 凭证解析清理完成：统一 `.env` 加载逻辑，改进宿主配置自动识别，并让 provider 原生环境变量处理更一致。
 - **2026-04-03** 🚀 发布 **v0.1.0** — Skill 质量监控上线：从优质 Skill 中提取结构模式，每日自动评估所有新提交；云端搜索全面升级，匹配更准、响应更快；社区自发形成生产级垂直 Skill 集群。前端新增中文（zh）国际化支持。
 - **2026-04-02** ⚡ 云端搜索升级，提升匹配质量、降低响应延迟。
 - **2026-03-31** 🛡️ 安全加固：zip 解压与 `import_skill` 新增路径穿越防护；CLI 启动时读取 `OPENSPACE_MODEL` 及 `OPENSPACE_LLM_*` 环境变量；修复 MiniMax 兼容性问题与 workflow ID 冲突。
@@ -194,6 +201,18 @@ openspace-mcp --help   # 验证安装
 
 > [!TIP]
 > 凭证（API 密钥、模型）会从你的 Agent 配置中**自动检测**，通常无需手动设置。
+
+> [!NOTE]
+> OpenSpace 支持 3 种启动方式：
+> - **stdio**：在宿主配置里保留 `command: "openspace-mcp"`。
+> - **SSE**：先启动 `openspace-mcp --transport sse --host 127.0.0.1 --port 8080`。
+> - **streamable HTTP**：先启动 `openspace-mcp --transport streamable-http --host 127.0.0.1 --port 8081`。
+>
+> 通用远端 endpoint：
+> - SSE: `http://127.0.0.1:8080/sse`
+> - streamable HTTP: `http://127.0.0.1:8081/mcp`
+>
+> `stdio` 最简单。HTTP 模式会把 OpenSpace 作为独立服务常驻，但 **不同宿主的注册写法不同**，而且 **调用方自己的 timeout 仍然生效**。
 
 **② 将 Skill 复制**到你的 Agent Skill 目录：
 
@@ -505,6 +524,14 @@ OpenSpace/
 │   │   ├── embedding.py                  # Skill 搜索的向量生成
 │   │   ├── auth.py                       # API 密钥管理
 │   │   └── cli/                          # CLI 工具（download_skill、upload_skill）
+│   │
+│   ├── 💬 communication/                  # 多渠道通信网关
+│   │   ├── gateway.py                    # 消息路由、会话管理、回复分发
+│   │   ├── adapters/                     # 平台适配器（WhatsApp、飞书）
+│   │   ├── bridges/                      # 非 Python 运行时（WhatsApp Baileys bridge）
+│   │   ├── config.py                     # 通信配置加载
+│   │   ├── session_store.py              # 按频道的会话持久化
+│   │   └── types.py                      # ChannelMessage, ChannelSource, SendResult
 │   │
 │   ├── 🔧 platform/                      # 平台抽象（系统信息、截图）
 │   ├── 🔧 host_detection/                # 自动检测 nanobot / openclaw 凭证

@@ -2,6 +2,17 @@
 
 This guide covers **agent-specific setup** for integrating OpenSpace. For installation and general concepts, see the [main README](../../README.md#-quick-start).
 
+**Quick recommendation:**
+- Use **stdio** if you want the simplest setup.
+- For **nanobot**, prefer **SSE** if you want OpenSpace to run as a standalone server.
+- For **openclaw**, prefer **streamable-http** for remote HTTP transport.
+
+**Common remote endpoints:**
+- Start `openspace-mcp --transport sse --host 127.0.0.1 --port 8080` and use `http://127.0.0.1:8080/sse`
+- Start `openspace-mcp --transport streamable-http --host 127.0.0.1 --port 8081` and use `http://127.0.0.1:8081/mcp`
+
+The endpoint is common; the **host config syntax is not**. nanobot uses `tools.mcpServers`, while openclaw uses `openclaw mcp set`.
+
 **Pick your agent:**
 
 | Agent | Setup Guide |
@@ -21,7 +32,7 @@ cp -r host_skills/skill-discovery/ /path/to/nanobot/nanobot/skills/
 cp -r host_skills/delegate-task/ /path/to/nanobot/nanobot/skills/
 ```
 
-### 2. Add MCP server to `~/.nanobot/config.json`
+### 2. Option A: stdio (simplest)
 
 ```json
 {
@@ -44,6 +55,40 @@ cp -r host_skills/delegate-task/ /path/to/nanobot/nanobot/skills/
 > [!TIP]
 > LLM credentials are auto-detected from nanobot's `providers.*` config — no need to set `OPENSPACE_LLM_API_KEY`.
 
+### 3. Option B: remote HTTP transport
+
+```json
+{
+  "tools": {
+    "mcpServers": {
+      "openspace": {
+        "type": "sse",
+        "url": "http://127.0.0.1:8080/sse",
+        "toolTimeout": 1200
+      }
+    }
+  }
+}
+```
+
+Or:
+
+```json
+{
+  "tools": {
+    "mcpServers": {
+      "openspace": {
+        "type": "streamableHttp",
+        "url": "http://127.0.0.1:8081/mcp",
+        "toolTimeout": 1200
+      }
+    }
+  }
+}
+```
+
+`toolTimeout` still matters here. Changing transport to `sse` or `streamableHttp` does **not** remove nanobot's per-call timeout for slow MCP tools.
+
 ---
 
 ## Setup for openclaw
@@ -55,7 +100,7 @@ cp -r host_skills/skill-discovery/ /path/to/openclaw/skills/
 cp -r host_skills/delegate-task/ /path/to/openclaw/skills/
 ```
 
-### 2. Register MCP server with env vars
+### 2. Option A: stdio via mcporter
 
 openclaw uses [mcporter](https://github.com/steipete/mcporter) as its MCP runtime. Register the server and pass env vars in one command:
 
@@ -65,6 +110,20 @@ mcporter config add openspace --command "openspace-mcp" \
   --env OPENSPACE_WORKSPACE=/path/to/OpenSpace \
   --env OPENSPACE_API_KEY=sk-xxx
 ```
+
+### 3. Option B: remote HTTP transport
+
+```bash
+openclaw mcp set openspace '{"url":"http://127.0.0.1:8081/mcp","transport":"streamable-http","connectionTimeoutMs":10000}'
+```
+
+If you specifically want legacy SSE instead, OpenClaw also supports:
+
+```bash
+openclaw mcp set openspace '{"url":"http://127.0.0.1:8080","connectionTimeoutMs":10000}'
+```
+
+`connectionTimeoutMs` controls connection establishment for the remote server. It does **not** guarantee unlimited runtime for a long-running MCP tool call.
 
 ---
 
@@ -93,7 +152,7 @@ All tools default to `"all"` (local + cloud) and **automatically fall back** to 
 ```
 Your Agent (nanobot / openclaw / ...)
   │
-  │  MCP protocol (stdio)
+  │  MCP protocol (stdio | HTTP/SSE | streamable-http)
   ▼
 openspace-mcp              ← 4 tools exposed
   ├── execute_task           ← multi-step grounding agent loop

@@ -21,6 +21,21 @@ logger = logging.getLogger("openspace.cloud")
 CLOUD_EMBEDDING_SEARCH_MAX_LIMIT = 300
 
 
+# Shared SkillRanker singleton. Its pickle cache survives process restarts;
+# the singleton itself is per-process and avoids reloading the pickle on every
+# search_skills invocation.
+_shared_ranker = None
+
+
+def _get_shared_ranker():
+    """Lazy-init shared ``SkillRanker`` (with persistent embedding cache)."""
+    global _shared_ranker
+    if _shared_ranker is None:
+        from openspace.skill_engine.skill_ranker import SkillRanker
+        _shared_ranker = SkillRanker(enable_cache=True)
+    return _shared_ranker
+
+
 def _check_safety(text: str) -> list[str]:
     """Lazy wrapper — avoids importing skill_engine at module load time."""
     from openspace.skill_engine.skill_utils import check_skill_safety
@@ -129,9 +144,9 @@ class SkillSearchEngine:
         limit: int,
     ) -> List[Dict[str, Any]]:
         """BM25 rough-rank to keep top candidates for embedding stage."""
-        from openspace.skill_engine.skill_ranker import SkillRanker, SkillCandidate
+        from openspace.skill_engine.skill_ranker import SkillCandidate
 
-        ranker = SkillRanker(enable_cache=True)
+        ranker = _get_shared_ranker()
         bm25_candidates = [
             SkillCandidate(
                 skill_id=c.get("skill_id", ""),
@@ -424,15 +439,33 @@ async def hybrid_search_skills(
     try:
         query_embedding = await asyncio.to_thread(generate_embedding, normalized_query)
         if query_embedding:
+            # Route candidate embedding generation through SkillRanker's persistent
+            # cache (pickle on disk) instead of re-computing on every query.
+            # Cloud candidates that already carry ``_embedding`` (from server) are
+            # left untouched.
+            from openspace.skill_engine.skill_ranker import SkillCandidate
+            ranker = _get_shared_ranker()
             for candidate in candidates:
-                if not candidate.get("_embedding") and candidate.get("_embedding_text"):
-                    candidate_embedding = await asyncio.to_thread(
-                        generate_embedding, candidate["_embedding_text"],
-                    )
-                    if candidate_embedding:
-                        candidate["_embedding"] = candidate_embedding
-    except Exception:
-        pass
+                if candidate.get("_embedding") or not candidate.get("_embedding_text"):
+                    continue
+                sid = candidate.get("skill_id") or ""
+                if not sid:
+                    # Without a stable skill_id the cache would collide; skip.
+                    continue
+                cand = SkillCandidate(
+                    skill_id=sid,
+                    name=candidate.get("name", ""),
+                    description=candidate.get("description", ""),
+                    body="",
+                    embedding_text=candidate["_embedding_text"],
+                )
+                candidate_embedding = await asyncio.to_thread(
+                    ranker.get_or_compute_embedding, cand,
+                )
+                if candidate_embedding:
+                    candidate["_embedding"] = candidate_embedding
+    except Exception as e:
+        logger.warning(f"hybrid_search_skills: embedding unavailable: {e}")
 
     engine = SkillSearchEngine()
     return engine.search(normalized_query, candidates, query_embedding=query_embedding, limit=limit)

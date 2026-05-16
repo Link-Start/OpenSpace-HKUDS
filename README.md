@@ -25,6 +25,13 @@
 
 ## 📢 News
 
+- **2026-04-16** 📊 **Evolution candidate lifecycle tracking** — skill store now records when evolution suggestions are processed (`evolution_processed_at`), cleanly distinguishing pending candidates from already-handled ones.
+- **2026-04-12** 🍎 **macOS platform hardening** — decoupled `atomacos` from core macOS imports so screenshots, window control, and recording work independently without it.
+- **2026-04-10** 🎯 **CAPTURED skills** now persist to the host agent's own skill directory instead of the default registry path. Cloud skill uploads now support **private visibility** correctly.
+- **2026-04-09** 💬 Multi-channel **communication gateway**. OpenSpace can now receive and respond to messages from external platforms. Ships with **WhatsApp** (Baileys bridge + QR auth) and **Feishu** (HTTP webhook) adapters, session management, attachment caching, and allowlist-based access control. See [`openspace/config/README.md`](openspace/config/README.md) for setup.
+- **2026-04-07** 🌐 OpenSpace MCP now supports standalone **SSE** and **streamable HTTP** startup, making it easier for remote hosts to connect over HTTP instead of stdio and bypass stdio-bound MCP server timeout bottlenecks. See the [host integration guide](openspace/host_skills/README.md) for setup details.
+- **2026-04-06** 🛠️ Fixed multiple runtime issues across grounding, MCP serving, skill evolution, and persistence, improving execution stability and recovery in long-running workflows.
+- **2026-04-05** 🧭 Cleaned up LLM credential resolution: centralized `.env` loading, improved host config auto-detection, and made provider-native env handling more consistent.
 - **2026-04-03** 🚀 Released **v0.1.0** — Skill quality monitoring: structural patterns extracted from high-quality skills now evaluate every new submission daily. Faster, more relevant cloud search. Production-grade vertical skill clusters emerging organically from the community. Frontend now supports Chinese (zh) i18n.
 - **2026-04-02** ⚡ Cloud search upgraded for higher relevance and lower latency.
 - **2026-03-31** 🛡️ Security hardening: hardened zip extraction and `import_skill` against path traversal. CLI now respects `OPENSPACE_MODEL` and `OPENSPACE_LLM_*` env vars; MiniMax compatibility; workflow ID collision fixes.
@@ -194,6 +201,18 @@ Works with any agent that supports skills (`SKILL.md`) — [Claude Code](https:/
 
 > [!TIP]
 > Credentials (API key, model) are **auto-detected** from your agent's config; you usually don't need to set them manually.
+
+> [!NOTE]
+> OpenSpace supports 3 launch modes:
+> - **stdio**: keep `command: "openspace-mcp"` in the host config.
+> - **SSE**: start `openspace-mcp --transport sse --host 127.0.0.1 --port 8080`.
+> - **streamable HTTP**: start `openspace-mcp --transport streamable-http --host 127.0.0.1 --port 8081`.
+>
+> Common remote endpoints:
+> - SSE endpoint: `http://127.0.0.1:8080/sse`
+> - streamable HTTP endpoint: `http://127.0.0.1:8081/mcp`
+>
+> `stdio` is the simplest option. HTTP modes keep OpenSpace as a standalone server, but **host-specific registration syntax** and **host-side timeouts** still apply.
 
 **② Copy skills** into your agent's skills directory:
 
@@ -505,6 +524,14 @@ OpenSpace/
 │   │   ├── embedding.py                  # Embedding generation for skill search
 │   │   ├── auth.py                       # API key management
 │   │   └── cli/                          # CLI tools (download_skill, upload_skill)
+│   │
+│   ├── 💬 communication/                  # Multi-Channel Communication Gateway
+│   │   ├── gateway.py                    # Message routing, session management, reply dispatch
+│   │   ├── adapters/                     # Platform adapters (WhatsApp, Feishu)
+│   │   ├── bridges/                      # Non-Python runtimes (WhatsApp Baileys bridge)
+│   │   ├── config.py                     # Communication config loader
+│   │   ├── session_store.py              # Per-channel session persistence
+│   │   └── types.py                      # ChannelMessage, ChannelSource, SendResult
 │   │
 │   ├── 🔧 platform/                      # Platform abstraction (system info, screenshots)
 │   ├── 🔧 host_detection/                # Auto-detect nanobot / openclaw credentials

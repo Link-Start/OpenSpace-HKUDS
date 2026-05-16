@@ -17,6 +17,8 @@ Desktop.ini
 .vscode/
 .idea/
 .pytest_cache/
+.venv/
+.test-venv/
 
 # Distribution / packaging
 dist/
@@ -28,8 +30,11 @@ build/
 .env
 !.env.example
 
-# MCP files
+# MCP config files
 openspace/config/config_mcp.json
+
+# Communication config files
+openspace/config/config_communication.json
 
 # Logs
 logs/

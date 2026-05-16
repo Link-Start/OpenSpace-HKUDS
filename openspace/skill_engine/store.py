@@ -124,6 +124,7 @@ CREATE TABLE IF NOT EXISTS execution_analyses (
     execution_note          TEXT NOT NULL DEFAULT '',
     tool_issues             TEXT NOT NULL DEFAULT '[]',
     candidate_for_evolution INTEGER NOT NULL DEFAULT 0,
+    evolution_processed_at  TEXT DEFAULT NULL,
     evolution_suggestions   TEXT NOT NULL DEFAULT '[]',
     analyzed_by             TEXT NOT NULL DEFAULT '',
     analyzed_at             TEXT NOT NULL
@@ -262,7 +263,18 @@ class SkillStore:
         """Create tables if they don't exist (idempotent via IF NOT EXISTS)."""
         with self._mu:
             self._conn.executescript(_DDL)
+            self._migrate_add_evolution_processed_at()
             self._conn.commit()
+
+    def _migrate_add_evolution_processed_at(self) -> None:
+        """Add evolution_processed_at column to existing DBs (idempotent)."""
+        try:
+            self._conn.execute(
+                "ALTER TABLE execution_analyses "
+                "ADD COLUMN evolution_processed_at TEXT DEFAULT NULL"
+            )
+        except sqlite3.OperationalError:
+            pass  # column already exists
 
     # Lifecycle
     def close(self) -> None:
@@ -816,17 +828,40 @@ class SkillStore:
 
     @_db_retry()
     def load_evolution_candidates(
-        self, limit: int = 50
+        self, limit: int = 50, *, include_processed: bool = False,
     ) -> List[ExecutionAnalysis]:
-        """Load analyses marked as evolution candidates."""
+        """Load analyses marked as evolution candidates.
+
+        Args:
+            limit: Max number of records.
+            include_processed: If False (default), only return candidates
+                whose suggestions have NOT been processed yet.
+        """
         with self._reader() as conn:
+            if include_processed:
+                where = "WHERE candidate_for_evolution=1"
+            else:
+                where = (
+                    "WHERE candidate_for_evolution=1 "
+                    "AND evolution_processed_at IS NULL"
+                )
             rows = conn.execute(
-                "SELECT * FROM execution_analyses "
-                "WHERE candidate_for_evolution=1 "
+                f"SELECT * FROM execution_analyses {where} "
                 "ORDER BY timestamp DESC LIMIT ?",
                 (limit,),
             ).fetchall()
             return [self._to_analysis(conn, r) for r in reversed(rows)]
+
+    @_db_retry()
+    def mark_evolution_processed(self, task_id: str) -> None:
+        """Mark an analysis's evolution suggestions as processed."""
+        with self._mu:
+            self._conn.execute(
+                "UPDATE execution_analyses "
+                "SET evolution_processed_at=? WHERE task_id=?",
+                (datetime.now().isoformat(), task_id),
+            )
+            self._conn.commit()
 
     @_db_retry()
     def find_skills_by_tool(self, tool_key: str) -> List[str]:
@@ -921,6 +956,11 @@ class SkillStore:
                 "SELECT COUNT(*) FROM execution_analyses "
                 "WHERE candidate_for_evolution=1"
             ).fetchone()[0]
+            n_unprocessed_candidates = conn.execute(
+                "SELECT COUNT(*) FROM execution_analyses "
+                "WHERE candidate_for_evolution=1 "
+                "AND evolution_processed_at IS NULL"
+            ).fetchone()[0]
             agg = conn.execute(
                 f"""
                 SELECT SUM(total_selections)  AS sel,
@@ -943,6 +983,7 @@ class SkillStore:
                 "by_origin": by_origin,
                 "total_analyses": n_analyses,
                 "evolution_candidates": n_candidates,
+                "unprocessed_evolution_candidates": n_unprocessed_candidates,
                 "total_selections": agg["sel"] or 0,
                 "total_applied": agg["app"] or 0,
                 "total_completions": agg["comp"] or 0,

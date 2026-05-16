@@ -101,9 +101,26 @@ class OpenSpaceClient:
         _, data = self._request("GET", path, timeout=timeout)
         return json.loads(data.decode("utf-8"))
 
+    @staticmethod
+    def _normalize_visibility_value(value: Any) -> Any:
+        """Treat legacy/group-shared non-public skills as private locally."""
+        if value == "group_only":
+            return "private"
+        return value
+
+    @classmethod
+    def _normalize_record_payload(cls, payload: Dict[str, Any]) -> Dict[str, Any]:
+        normalized = dict(payload)
+        if "visibility" in normalized:
+            normalized["visibility"] = cls._normalize_visibility_value(
+                normalized.get("visibility")
+            )
+        return normalized
+
     def fetch_record(self, record_id: str) -> Dict[str, Any]:
         """GET /records/{record_id} — fetch record metadata."""
-        return self._get_json(f"/records/{urllib.parse.quote(record_id)}")
+        data = self._get_json(f"/records/{urllib.parse.quote(record_id)}")
+        return self._normalize_record_payload(data)
 
     def download_artifact(self, record_id: str) -> bytes:
         """GET /records/{record_id}/download — download artifact zip bytes."""
@@ -134,7 +151,10 @@ class OpenSpaceClient:
             path = f"/records/metadata?{urllib.parse.urlencode(params)}"
             data = self._get_json(path, timeout=15)
 
-            all_items.extend(data.get("items", []))
+            all_items.extend(
+                self._normalize_record_payload(item)
+                for item in data.get("items", [])
+            )
 
             if not data.get("has_more"):
                 break
@@ -169,7 +189,8 @@ class OpenSpaceClient:
             extra_headers={"Content-Type": "application/json"},
             timeout=30,
         )
-        return json.loads(response_body.decode("utf-8"))
+        items = json.loads(response_body.decode("utf-8"))
+        return [self._normalize_record_payload(item) for item in items]
 
     def stage_artifact(self, skill_dir: Path) -> tuple[str, int]:
         """POST /artifacts/stage — upload skill files.
@@ -295,7 +316,7 @@ class OpenSpaceClient:
         parents = parent_skill_ids or []
         self._validate_origin_parents(origin, parents)
 
-        api_visibility = "group_only" if visibility == "private" else "public"
+        api_visibility = visibility
 
         # Step 1: Stage
         logger.info(f"upload_skill: staging files for '{name}'")

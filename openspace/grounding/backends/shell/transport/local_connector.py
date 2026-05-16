@@ -11,6 +11,8 @@ work without any changes.
 import asyncio
 import os
 import platform
+import signal
+import subprocess
 import tempfile
 import uuid
 from typing import Any, Optional, Dict
@@ -94,6 +96,105 @@ def _wrap_script_with_conda(script: str, conda_env: str | None) -> str:
             return script
 
 
+def _subprocess_group_kwargs() -> Dict[str, Any]:
+    """Return platform-specific kwargs that allow timeout cleanup."""
+    if platform_name == "Windows":
+        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        return {"creationflags": creationflags} if creationflags else {}
+    return {"start_new_session": True}
+
+
+async def _wait_for_exit(proc: asyncio.subprocess.Process, timeout: float) -> bool:
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=timeout)
+        return True
+    except asyncio.TimeoutError:
+        return False
+
+
+async def _kill_single_process(proc: asyncio.subprocess.Process) -> bool:
+    """Fallback cleanup for platforms where process-tree cleanup is unavailable."""
+    for action in (proc.terminate, proc.kill):
+        if proc.returncode is not None:
+            return True
+        try:
+            action()
+        except ProcessLookupError:
+            return True
+        except Exception as e:
+            logger.warning("Process cleanup action failed: %s", e)
+        if await _wait_for_exit(proc, timeout=5):
+            return True
+    return proc.returncode is not None
+
+
+async def _kill_windows_process_tree(proc: asyncio.subprocess.Process, pid: int) -> bool:
+    """Best-effort Windows process-tree cleanup."""
+    try:
+        taskkill = await asyncio.create_subprocess_exec(
+            "taskkill",
+            "/PID",
+            str(pid),
+            "/T",
+            "/F",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await asyncio.wait_for(taskkill.wait(), timeout=5)
+    except (FileNotFoundError, PermissionError, OSError, asyncio.TimeoutError) as e:
+        logger.warning("taskkill process-tree cleanup failed: %s", e)
+
+    if await _wait_for_exit(proc, timeout=1):
+        return True
+    return await _kill_single_process(proc)
+
+
+async def _kill_posix_process_tree(proc: asyncio.subprocess.Process, pid: int) -> bool:
+    """Send SIGTERM, then SIGKILL, to the POSIX process group."""
+    try:
+        pgid = os.getpgid(pid)
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return True
+    except PermissionError as e:
+        logger.warning("SIGTERM to process group failed: %s", e)
+        return False
+    except (AttributeError, OSError) as e:
+        logger.warning("Process-group cleanup unavailable: %s", e)
+        return await _kill_single_process(proc)
+
+    if await _wait_for_exit(proc, timeout=5):
+        return True
+
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGKILL)
+    except ProcessLookupError:
+        return True
+    except PermissionError as e:
+        logger.warning("SIGKILL to process group failed: %s", e)
+        return False
+    except (AttributeError, OSError) as e:
+        logger.warning("Process-group SIGKILL unavailable: %s", e)
+        return await _kill_single_process(proc)
+
+    return await _wait_for_exit(proc, timeout=5)
+
+
+async def _kill_process_tree(proc: asyncio.subprocess.Process, timeout: int) -> bool:
+    """Terminate a timed-out subprocess and its descendants when possible."""
+    if proc.returncode is not None:
+        return True
+
+    pid = proc.pid
+    logger.warning(
+        "Subprocess timeout after %ss; killing process tree (pid=%s)", timeout, pid
+    )
+
+    if platform_name == "Windows":
+        return await _kill_windows_process_tree(proc, pid)
+    return await _kill_posix_process_tree(proc, pid)
+
+
 class LocalShellConnector(BaseConnector[Any]):
     """
     Shell connector that runs scripts **locally** using asyncio subprocesses,
@@ -156,6 +257,7 @@ class LocalShellConnector(BaseConnector[Any]):
                 stderr=asyncio.subprocess.PIPE,
                 cwd=cwd,
                 env=exec_env,
+                **_subprocess_group_kwargs(),
             )
             stdout_b, stderr_b = await asyncio.wait_for(
                 proc.communicate(), timeout=timeout
@@ -172,10 +274,12 @@ class LocalShellConnector(BaseConnector[Any]):
                 "returncode": returncode,
             }
         except asyncio.TimeoutError:
+            killed = await _kill_process_tree(proc, timeout)
+            suffix = "(killed)" if killed else "(kill attempted)"
             return {
                 "status": "error",
-                "output": f"Execution timed out after {timeout} seconds",
-                "content": f"Execution timed out after {timeout} seconds",
+                "output": f"Execution timed out after {timeout} seconds {suffix}",
+                "content": f"Execution timed out after {timeout} seconds {suffix}",
                 "error": "",
                 "returncode": -1,
             }
@@ -210,6 +314,7 @@ class LocalShellConnector(BaseConnector[Any]):
                 stderr=asyncio.subprocess.STDOUT,
                 cwd=cwd,
                 env=exec_env,
+                **_subprocess_group_kwargs(),
             )
             stdout_b, _ = await asyncio.wait_for(
                 proc.communicate(), timeout=timeout
@@ -225,10 +330,12 @@ class LocalShellConnector(BaseConnector[Any]):
                 "returncode": returncode,
             }
         except asyncio.TimeoutError:
+            killed = await _kill_process_tree(proc, timeout)
+            suffix = "(killed)" if killed else "(kill attempted)"
             return {
                 "status": "error",
-                "output": f"Script execution timed out after {timeout} seconds",
-                "content": f"Script execution timed out after {timeout} seconds",
+                "output": f"Script execution timed out after {timeout} seconds {suffix}",
+                "content": f"Script execution timed out after {timeout} seconds {suffix}",
                 "error": "",
                 "returncode": -1,
             }
