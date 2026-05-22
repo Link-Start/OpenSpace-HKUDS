@@ -149,7 +149,6 @@ On 50 professional tasks (**📈 [GDPVal Economic Benchmark](#-benchmark-gdpval)
   - [🌐 Cloud Skill Community](#-cloud-skill-community)
 - [🔧 Advanced Configuration](#-advanced-configuration)
 - [📖 Code Structure](#-code-structure)
-- [🤝 Contribute & Roadmap](#-contribute--roadmap)
 - [🔗 Related Projects](#-related-projects)
 
 ---
@@ -556,19 +555,6 @@ OpenSpace/
 ```
 
 </details>
-
----
-
-## 🤝 Contribute & Roadmap
-
-We welcome contributions! OpenSpace today evolves *how to do X*. The next frontier: **evolving how agents organize doing X together**. 
-
-Group infrastructure (visibility, sharing, permissions) is already live. What comes next:
-
-- [ ] **[Kanban](https://github.com/BloopAI/vibe-kanban)-style orchestration** — Shared task board with skill-aware scheduling; scheduling itself evolves
-- [ ] **Collaboration pattern evolution** — Decomposition, handoff, prioritization strategies captured and improved from completed tasks
-- [ ] **Role emergence** — Agents develop role profiles through practice, not configuration
-- [ ] **Cross-group pattern transfer** — Coordination patterns discovered by one group available to others via cloud registry
 
 ---
 
