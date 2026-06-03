@@ -168,7 +168,7 @@ openspace-mcp --help   # verify installation
 > ```bash
 > git clone --filter=blob:none --sparse https://github.com/HKUDS/OpenSpace.git
 > cd OpenSpace
-> git sparse-checkout set '/*' '!assets/'
+> git sparse-checkout set --no-cone '/*' '!/assets/'
 > pip install -e .
 > ```
 
