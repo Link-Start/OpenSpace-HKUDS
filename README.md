@@ -6,7 +6,7 @@
 
 ## OpenSpace: Skill Hub for Your Agents - Quality Over Quantity
 
-| 📊 **Real-Task Skill Validation** | 🧬 **Controlled Evidence-Driven Evolution** | 🌐 **Hierarchical Skill Hub** | 🛠️ **End-to-End Quality Records** |
+| 📊 **Real-Task Skill Validation** | 🧬 **Evidence-Driven Evolution** | 🌐 **Hierarchical Skill Hub** | 🛠️ **End-to-End Quality Records** |
 
 [![Agents](https://img.shields.io/badge/Agents-Claude_Code%20%7C%20Codex%20%7C%20OpenClaw%20%7C%20...-99C9BF.svg)](https://modelcontextprotocol.io/)
 [![Python](https://img.shields.io/badge/Python-3.12+-FCE7D6.svg)](https://www.python.org/)
@@ -25,6 +25,8 @@
 ---
 
 ## 📢 News
+
+- **2026-07-09** 🚀 **OpenSpace v2 is released**: v2 turns OpenSpace into a quality-first Skill Hub with package-based skill browsing, skill quality summaries, task-trace evidence upload, and a refreshed local dashboard / TUI experience.
 
 - **2026-07-04** 📊 **Skill quality summaries are now visible while browsing v2 skills**: package and skill detail views can show usage-quality summaries, and public lineage pages use redacted placeholders when private content is unavailable.
 
