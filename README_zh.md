@@ -26,6 +26,8 @@
 
 ## 📢 最新动态
 
+- **2026-07-09** 🚀 **OpenSpace v2 正式发布**：v2 将 OpenSpace 升级为质量优先的 Skill Hub，带来基于 package 的 Skill 浏览、Skill 质量摘要、task-trace 证据上传，以及更新后的本地 dashboard / TUI 体验。
+
 - **2026-07-04** 📊 **浏览 v2 Skill 时可以看到质量摘要**：package 与 skill detail 视图可以展示 usage-quality summary；public lineage 页面在无法展示私有内容时会使用脱敏占位。
 
 - **2026-07-03** 🔎 **Package 内 Skill 搜索与 task-trace 上传成为 v2 正式流程**：package 页面可以直接搜索 Skill；task trace 可以被校验、存储，并以幂等方式上传为质量证据。
