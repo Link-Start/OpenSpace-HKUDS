@@ -36,12 +36,27 @@ logger = Logger.get_logger(__name__)
 # Constants  (Implementation: constants/toolLimits.ts + toolResultStorage.ts)
 # ---------------------------------------------------------------------------
 
+
+def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return max(minimum, int(raw))
+    except ValueError:
+        logger.warning("Invalid %s=%r; using default %s", name, raw, default)
+        return default
+
 TOOL_RESULTS_SUBDIR = "tool-results"
 
 PERSISTED_OUTPUT_TAG = "<persisted-output>"
 PERSISTED_OUTPUT_CLOSING_TAG = "</persisted-output>"
 
-PREVIEW_SIZE_CHARS: int = 2_000
+PREVIEW_SIZE_CHARS: int = _env_int(
+    "OPENSPACE_TOOL_RESULT_PREVIEW_CHARS",
+    2_000,
+    minimum=200,
+)
 """OpenSpace ``PREVIEW_SIZE_BYTES = 2000``.  We use character count (OpenSpace uses byte
 count, but since os deals in Python strings, chars is the natural unit)."""
 
@@ -49,7 +64,11 @@ TOOL_RESULT_CLEARED_MESSAGE = "[Old tool result content cleared]"
 
 READ_TOOL_NAME = "read"
 
-MAX_TOOL_RESULTS_PER_MESSAGE_CHARS: int = 200_000
+MAX_TOOL_RESULTS_PER_MESSAGE_CHARS: int = _env_int(
+    "OPENSPACE_MAX_TOOL_RESULTS_PER_MESSAGE_CHARS",
+    200_000,
+    minimum=4_000,
+)
 """OpenSpace ``MAX_TOOL_RESULTS_PER_MESSAGE_CHARS``.  Aggregate budget for all
 tool_result blocks within one user message.  Consumed by the per-message
 budget enforcement in the agent loop (step 7.1)."""

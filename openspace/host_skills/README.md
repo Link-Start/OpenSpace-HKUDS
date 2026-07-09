@@ -19,7 +19,7 @@ The endpoint is common; the **host config syntax is not**. nanobot uses `tools.m
 |------------|-------------|
 | **[nanobot](https://github.com/HKUDS/nanobot)** | [Setup for nanobot](#setup-for-nanobot) |
 | **[openclaw](https://github.com/openclaw/openclaw)** | [Setup for openclaw](#setup-for-openclaw) |
-| **Other agents** | Follow the [generic setup](../../README.md#-path-a-empower-your-agent-with-openspace) in the main README |
+| **Other agents** | Follow the [generic setup](../../README.md#-path-a-for-your-agent) in the main README |
 
 ---
 

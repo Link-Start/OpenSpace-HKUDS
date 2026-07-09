@@ -90,6 +90,10 @@ export const CORE_TO_TUI_MSG_TYPES = [
   "dynamic_skills_consumed",
   "skill_discovery_prefetch_consumed",
   "cost_summary",
+  "side_query_start",
+  "side_query_complete",
+  "side_query_cancelled",
+  "side_query_error",
   "llm_retry",
   "memory_extraction_skipped",
   "memory_extraction_coalesced",
@@ -102,8 +106,11 @@ export const CORE_TO_TUI_MSG_TYPES = [
   "session_memory_compact",
   "session_memory_compact_skipped",
   "session_memory_compact_resumed_session",
+  "session_memory_checked",
+  "session_memory_updated",
   "tool_cancelled",
   "tool_deferred_intercepted",
+  "bash_tool_command_executed",
   "tool_executing",
   "tool_hook_stopped",
   "tool_permission_denied",
@@ -213,6 +220,10 @@ const KNOWN_EVENT_TYPES: ReadonlySet<string> = new Set([
   "dynamic_skills_consumed",
   "skill_discovery_prefetch_consumed",
   "cost_summary",
+  "side_query_start",
+  "side_query_complete",
+  "side_query_cancelled",
+  "side_query_error",
   "llm_retry",
   "memory_extraction_skipped",
   "memory_extraction_coalesced",
@@ -225,8 +236,11 @@ const KNOWN_EVENT_TYPES: ReadonlySet<string> = new Set([
   "session_memory_compact",
   "session_memory_compact_skipped",
   "session_memory_compact_resumed_session",
+  "session_memory_checked",
+  "session_memory_updated",
   "tool_cancelled",
   "tool_deferred_intercepted",
+  "bash_tool_command_executed",
   "tool_executing",
   "tool_hook_stopped",
   "tool_permission_denied",
@@ -380,7 +394,11 @@ export interface ToolProgressData {
 
 export interface ToolCompleteData {
   tool_use_id: string;
-  result: unknown;
+  result?: unknown;
+  status?: string;
+  duration_ms?: number;
+  result_size_chars?: number;
+  has_multimodal_content?: boolean;
 }
 
 export interface ToolErrorData {
@@ -671,7 +689,7 @@ export interface SessionSummaryItem {
   agent_name?: string;
   agent_type?: string;
   mode?: string;
-  cost?: number;
+  cost?: number | null;
   forked_from?: string;
   same_project?: boolean;
   preview: string;
@@ -700,7 +718,7 @@ export interface SessionRestoredData {
   metadata: Record<string, unknown>;
   runtime: Record<string, unknown>;
   messages: StructuredMessageData[];
-  cost?: number;
+  cost?: number | null;
   agent?: Record<string, unknown> | null;
   standalone_agent_context?: Record<string, unknown> | null;
   worktree?: Record<string, unknown> | null;
@@ -1050,6 +1068,10 @@ export type EventDataMap = {
   dynamic_skills_consumed: RuntimeActivityData;
   skill_discovery_prefetch_consumed: RuntimeActivityData;
   cost_summary: RuntimeActivityData;
+  side_query_start: RuntimeActivityData;
+  side_query_complete: RuntimeActivityData;
+  side_query_cancelled: RuntimeActivityData;
+  side_query_error: RuntimeActivityData;
   llm_retry: RuntimeActivityData;
   memory_extraction_skipped: RuntimeActivityData;
   memory_extraction_coalesced: RuntimeActivityData;
@@ -1062,8 +1084,11 @@ export type EventDataMap = {
   session_memory_compact: RuntimeActivityData;
   session_memory_compact_skipped: RuntimeActivityData;
   session_memory_compact_resumed_session: RuntimeActivityData;
+  session_memory_checked: RuntimeActivityData;
+  session_memory_updated: RuntimeActivityData;
   tool_cancelled: RuntimeActivityData;
   tool_deferred_intercepted: RuntimeActivityData;
+  bash_tool_command_executed: RuntimeActivityData;
   tool_executing: RuntimeActivityData;
   tool_hook_stopped: RuntimeActivityData;
   tool_permission_denied: RuntimeActivityData;

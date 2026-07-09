@@ -238,6 +238,61 @@ For a successful edit, output the edit content first, then append:
 {
   "status": "complete",
   "change_summary": "One sentence describing the edit.",
+  "intent_spec": {
+    "capability": "The reusable capability this skill gives the agent.",
+    "trigger_contexts": [
+      "Concrete user/task wording or runtime context where this skill should trigger."
+    ],
+    "non_trigger_contexts": [
+      "Near-miss wording or contexts where this skill should not trigger."
+    ],
+    "expected_artifacts": [
+      "Files, outputs, or decisions expected when the skill is used."
+    ],
+    "success_criteria": [
+      "Observable criteria that show the skill helped."
+    ],
+    "tool_dependencies": [
+      "Only tools materially required by the workflow."
+    ],
+    "resource_plan": {
+      "scripts": "none, or the reusable scripts included and why",
+      "references": "none, or the reference files included and why",
+      "assets": "none, or the assets included and why"
+    },
+    "parent_difference": "For DERIVED only: how this differs from the parent skill.",
+    "observed_pattern": "For CAPTURED only: the observed reusable pattern.",
+    "generalization_boundary": "For CAPTURED only: what was abstracted away and where this should not apply."
+  },
+  "eval_plan": {
+    "positive_trigger_queries": [
+      "A realistic user/task query that should select this skill."
+    ],
+    "negative_trigger_queries": [
+      "A realistic near-miss query that should not select this skill."
+    ],
+    "replay_tasks": [
+      {
+        "prompt": "A realistic task prompt for paired baseline-vs-candidate replay.",
+        "task_id": "optional-source-or-generated-id",
+        "judge_policy": "deterministic|llm|gdpval|hybrid|manual",
+        "expected_outcome": "What should improve or remain non-regressed."
+      }
+    ],
+    "deterministic_assertions": [
+      {
+        "type": "file_exists|error_absent|artifact_valid|manual",
+        "target": "What to check",
+        "expected": true,
+        "description": "Why this assertion proves the skill helped."
+      }
+    ],
+    "judge_policy": "hybrid",
+    "success_criteria": [
+      "Quality must not regress and the observed failure/inefficiency should disappear."
+    ],
+    "baseline": "active"
+  },
   "runtime_overlay": null
 }
 *** End Evolution Finalization
@@ -259,6 +314,15 @@ Rules:
 - Do not put text after the finalization block.
 - On success, the edit content before the finalization block must be directly
   applicable by the skill edit applier.
+- ``intent_spec`` and ``eval_plan`` are required for every FIX, DERIVED, and
+  CAPTURED action. They are not optional notes: they drive behavior-evaluation
+  before the skill can be committed.
+- Include at least one positive trigger query and one near-miss negative trigger
+  query. For FIX and DERIVED, include at least one replay task. For CAPTURED,
+  include replay tasks whenever the source execution can be replayed; otherwise
+  include deterministic assertions and explain the limitation in ``notes``.
+- Keep eval prompts realistic. Do not include hidden expected answers, intended
+  fixes, or conclusions that would leak the evaluation target.
 - On failure, do not output any edit content.
 """
 

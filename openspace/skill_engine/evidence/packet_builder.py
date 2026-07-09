@@ -177,7 +177,7 @@ class PacketBuilder:
                 missing_ref_types=[],
             )
 
-        watermark = int(
+        base_watermark = int(
             _attr(job, "manifest_watermark")
             or _mapping_get(job, "manifest_watermark")
             or self._latest_watermark()
@@ -197,6 +197,11 @@ class PacketBuilder:
                 _attr(job, "trigger_type")
                 or _mapping_get(job, "trigger_type")
             ),
+        )
+        watermark = self._effective_job_watermark(
+            job,
+            profile=profile,
+            base_watermark=base_watermark,
         )
 
         try:
@@ -935,6 +940,18 @@ class PacketBuilder:
                 return 0
         return 0
 
+    def _effective_job_watermark(
+        self,
+        job: Any,
+        *,
+        profile: EvidenceProfile,
+        base_watermark: int,
+    ) -> int:
+        if not _should_follow_latest_quality_refs(job, profile):
+            return base_watermark
+        latest = self._latest_watermark()
+        return max(base_watermark, latest)
+
 
 def _profile_ref_types(profile: EvidenceProfile) -> set[str]:
     result: set[str] = set()
@@ -1290,6 +1307,8 @@ def _expand_ref_text(
         return _manual_request_text(ref), "none"
     if ref.ref_type in {"tool_quality_record", "tool_incident"}:
         return _metadata_summary_text(ref), "none"
+    if ref.ref_type == "quality_signal_ref":
+        return _quality_signal_text(ref), "none"
     if ref.ref_type in {"evolution_candidate_ref", "decision_rationale_ref"}:
         return _metadata_summary_text(ref), "none"
     preview = str(ref.preview or "")[:_GENERIC_PREVIEW_CHARS]
@@ -1457,6 +1476,28 @@ def _metadata_summary_text(ref: ResourceRef) -> str:
     )
 
 
+def _quality_signal_text(ref: ResourceRef) -> str:
+    metadata = ref.metadata
+    fields = {
+        "signal_type": metadata.get("signal_type"),
+        "subject_type": metadata.get("subject_type"),
+        "subject_id": metadata.get("subject_id"),
+        "actionability": metadata.get("actionability"),
+        "evidence_status": metadata.get("evidence_status"),
+        "policy_reason": metadata.get("policy_reason"),
+        "summary": metadata.get("summary") or ref.preview,
+        "tool_key": metadata.get("tool_key"),
+        "tool_use_id": metadata.get("tool_use_id"),
+        "skill_id": metadata.get("skill_id"),
+        "skill_version": metadata.get("skill_version"),
+        "source_watermark": metadata.get("source_watermark"),
+        "signal_write_watermark": metadata.get("signal_write_watermark"),
+        "raw_backrefs": ref.raw_backrefs,
+        "missing_refs": metadata.get("missing_refs"),
+    }
+    return _section(ref, fields)
+
+
 def _section(ref: ResourceRef, fields: Mapping[str, Any]) -> str:
     lines = [
         f"ref_id: {ref.ref_id}",
@@ -1618,6 +1659,16 @@ def _str_list(value: Any) -> list[str]:
 
 def _stable_str_list(value: Any) -> list[str]:
     return list(dict.fromkeys(_str_list(value)))
+
+
+def _should_follow_latest_quality_refs(job: Any, profile: EvidenceProfile) -> bool:
+    if profile.name != "analysis_current_task" or profile.subprofile != "task_finished":
+        return False
+    trigger_type = str(
+        _attr(job, "trigger_type") or _mapping_get(job, "trigger_type") or ""
+    ).strip().upper()
+    reason = str(_attr(job, "reason") or _mapping_get(job, "reason") or "").strip()
+    return trigger_type == "ANALYSIS" and reason == "task_finished"
 
 
 def _add_selected_ref(

@@ -268,7 +268,12 @@ For commands that are harder to parse at a glance (piped commands, obscure flags
 - find . -name "*.tmp" -exec rm {} \\; -> "Find and delete all .tmp files recursively"
 - git reset --hard origin/main -> "Discard all local changes and match remote main"
 - curl -s url | jq '.data[]' -> "Fetch JSON from URL and extract data array elements"''',
-        "run_in_background": "Set to true to run this command in the background. Use Read to read the output later.",
+        "run_in_background": (
+            "Set to true to run this command in the background. The result "
+            "will include an output file path; inspect it later with a short "
+            "bash command such as `cat <path>` or `tail <path>`, unless a "
+            "TaskGet tool is actually available in this turn."
+        ),
         "backgroundedByUser": (
             "Internal field: true if the user manually backgrounded the "
             "command with Ctrl+B."
@@ -1263,18 +1268,26 @@ For commands that are harder to parse at a glance (piped commands, obscure flags
                 "you will be notified when it completes. Output is being "
                 f"written to: {output_path}. In assistant mode, delegate "
                 "long-running work to a subagent or use run_in_background "
-                "to keep this conversation responsive."
+                "to keep this conversation responsive. If you need the output "
+                "before continuing and TaskGet is available in this turn, use "
+                f"`TaskGet(task_id=\"{task_id}\", block=true, timeout=600000)`. "
+                "Otherwise inspect it with a short bash command such as "
+                f"`cat {output_path}` or `tail {output_path}`."
             )
         elif backgrounded_by_user:
             content = (
                 f"Command was manually backgrounded by user with ID: {task_id}. "
-                f"Output is being written to: {output_path}"
+                f"Output is being written to: {output_path}. Inspect it with "
+                f"`cat {output_path}` or `tail {output_path}`."
             )
         else:
             content = (
                 f"Command running in background with ID: {task_id}. "
                 f"Output is being written to: {output_path} (pid {pid}).\n"
-                "Use TaskGet to inspect status/output or TaskStop to stop it."
+                "If TaskGet is available in this turn, inspect output with "
+                f"`TaskGet(task_id=\"{task_id}\", block=true, timeout=600000)`. "
+                "Otherwise use a short bash command such as "
+                f"`cat {output_path}` or `tail {output_path}`."
             )
         await self._emit_bash_command_executed(
             command,
@@ -1515,7 +1528,10 @@ For commands that are harder to parse at a glance (piped commands, obscure flags
             content = (
                 f"Command running in background with ID: {task.id}. "
                 f"Output is being written to: {task.output_file} (pid {task.pid}).\n"
-                "Use TaskGet to inspect status/output or TaskStop to stop it."
+                "If TaskGet is available in this turn, inspect output with "
+                f"`TaskGet(task_id=\"{task.id}\", block=true, timeout=600000)`. "
+                "Otherwise use a short bash command such as "
+                f"`cat {task.output_file}` or `tail {task.output_file}`."
             )
             await self._emit_bash_command_executed(
                 command,
@@ -1548,13 +1564,35 @@ For commands that are harder to parse at a glance (piped commands, obscure flags
                     start_new_session=True,
                 )
             else:
-                process = await asyncio.create_subprocess_shell(
-                    command,
-                    stdin=asyncio.subprocess.DEVNULL,
-                    stdout=output_file,
-                    stderr=asyncio.subprocess.STDOUT,
-                    start_new_session=True,  # detach from parent process group
+                from openspace.grounding.backends.shell.transport.local_connector import (
+                    _wrap_script_with_conda,
                 )
+
+                final_command = _wrap_script_with_conda(command, conda_env)
+                effective_env = {**_os.environ, **(env or {})}
+                bash_path = shutil.which("bash", path=effective_env.get("PATH"))
+                if bash_path:
+                    process = await asyncio.create_subprocess_exec(
+                        bash_path,
+                        "-lc",
+                        final_command,
+                        stdin=asyncio.subprocess.DEVNULL,
+                        stdout=output_file,
+                        stderr=asyncio.subprocess.STDOUT,
+                        cwd=cwd or None,
+                        env=effective_env,
+                        start_new_session=True,  # detach from parent process group
+                    )
+                else:
+                    process = await asyncio.create_subprocess_shell(
+                        final_command,
+                        stdin=asyncio.subprocess.DEVNULL,
+                        stdout=output_file,
+                        stderr=asyncio.subprocess.STDOUT,
+                        cwd=cwd or None,
+                        env=effective_env,
+                        start_new_session=True,  # detach from parent process group
+                    )
         except Exception as e:
             output_file.close()
             return ToolResult(
@@ -1600,7 +1638,10 @@ For commands that are harder to parse at a glance (piped commands, obscure flags
         content = (
             f"Command running in background with ID: {task_id}. "
             f"Output is being written to: {output_path} (pid {process.pid}).\n"
-            "Use read on the output path to inspect progress / final output."
+            "If TaskGet is available in this turn, inspect output with "
+            f"`TaskGet(task_id=\"{task_id}\", block=true, timeout=600000)`. "
+            "Otherwise use a short bash command such as "
+            f"`cat {output_path}` or `tail {output_path}`."
         )
         await self._emit_bash_command_executed(
             command,

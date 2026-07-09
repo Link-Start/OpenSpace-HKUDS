@@ -6,6 +6,7 @@ import SkillsPage from './pages/SkillsPage';
 import SkillDetailPage from './pages/SkillDetailPage';
 import WorkflowsPage from './pages/WorkflowsPage';
 import WorkflowDetailPage from './pages/WorkflowDetailPage';
+import AgentTracePage from './pages/AgentTracePage';
 
 const router = createBrowserRouter([
   {
@@ -19,6 +20,7 @@ const router = createBrowserRouter([
       { path: 'skills/:skillId', element: <SkillDetailPage /> },
       { path: 'workflows', element: <WorkflowsPage /> },
       { path: 'workflows/:workflowId', element: <WorkflowDetailPage /> },
+      { path: 'workflows/:workflowId/trace', element: <AgentTracePage /> },
     ],
   },
 ]);

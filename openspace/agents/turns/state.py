@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -35,6 +36,18 @@ class TurnState:
     stop_reason_final: str | None = None
     conversation_recovery_retry_count: int = 0
     budget_tracker: BudgetTracker = field(default_factory=BudgetTracker)
+    started_at_monotonic: float = field(default_factory=time.monotonic)
+    bench_finalize_nudge_count: int = 0
+    bench_finalize_nudge_iteration: int | None = None
+    bench_finalize_nudge_monotonic: float | None = None
+    bench_finalize_last_tool_iteration: int | None = None
+    bench_finalize_last_tool_monotonic: float | None = None
+    bench_visible_checker_failed: bool = False
+    bench_visible_checker_failure_iteration: int | None = None
+    bench_visible_checker_failure_command: str | None = None
+    bench_visible_checker_failure_excerpt: str | None = None
+    bench_visible_checker_pass_iteration: int | None = None
+    force_tool_choice_next_call: bool = False
 
     @classmethod
     def from_agent_context(

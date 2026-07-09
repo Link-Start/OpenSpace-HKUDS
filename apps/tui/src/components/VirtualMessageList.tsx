@@ -18,6 +18,7 @@ const SCROLL_HEADROOM = 2;
 
 export type JumpHandle = {
   jumpToIndex: (index: number) => void;
+  jumpToMessageId?: (id: string) => void;
   setSearchQuery: (query: string) => void;
   nextMatch: () => void;
   prevMatch: () => void;

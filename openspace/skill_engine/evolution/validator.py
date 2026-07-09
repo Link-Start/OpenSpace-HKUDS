@@ -12,6 +12,9 @@ from typing import Any, Mapping
 
 from openspace.skill_engine.evidence import EvidencePacket, ResourceRef
 from openspace.skill_engine.evidence.redaction import contains_secret
+from openspace.skill_engine.evolution.authoring_contract import (
+    contract_validation_failures,
+)
 from openspace.skill_engine.skill_utils import (
     SKILL_FILENAME,
     parse_frontmatter,
@@ -267,6 +270,7 @@ class EvolutionValidator:
             )
             failures.extend(self._secret_failures(snapshot, validator_packet))
             failures.extend(self._duplicate_failures(staged, action))
+            failures.extend(contract_validation_failures(staged, action))
             review_warnings.extend(self._overlay_review_warnings(staged, admission))
 
         failures = _dedupe(failures)

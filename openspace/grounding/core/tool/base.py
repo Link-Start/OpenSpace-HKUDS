@@ -9,6 +9,7 @@ Tool contract note (Implementation: Tool.ts, os: this file):
 import asyncio
 import inspect
 import math
+import os
 import time
 from abc import ABC, abstractmethod
 from functools import lru_cache
@@ -27,7 +28,22 @@ if TYPE_CHECKING:
 logger = Logger.get_logger(__name__)
 
 
-DEFAULT_MAX_RESULT_SIZE_CHARS: int = 50_000
+def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return max(minimum, int(raw))
+    except ValueError:
+        logger.warning("Invalid %s=%r; using default %s", name, raw, default)
+        return default
+
+
+DEFAULT_MAX_RESULT_SIZE_CHARS: int = _env_int(
+    "OPENSPACE_DEFAULT_MAX_RESULT_SIZE_CHARS",
+    50_000,
+    minimum=1_000,
+)
 """Per-tool default ceiling for result content before persistence to disk.
 
 Identical to OpenSpace ``DEFAULT_MAX_RESULT_SIZE_CHARS`` in ``constants/toolLimits.ts``.

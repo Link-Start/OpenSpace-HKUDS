@@ -3,6 +3,7 @@ export const KEYBINDING_CONTEXTS = [
   "Chat",
   "Autocomplete",
   "Confirmation",
+  "PermissionEdit",
   "Prompt",
   "MessageActions",
   "Transcript",
@@ -54,7 +55,17 @@ export const KEYBINDING_ACTIONS = [
   "confirm:next",
   "confirm:nextField",
   "confirm:previousField",
+  "confirm:digit1",
+  "confirm:digit2",
+  "confirm:digit3",
+  "confirm:digit4",
+  "confirm:digit5",
+  "confirm:digit6",
+  "confirm:digit7",
+  "confirm:digit8",
+  "confirm:digit9",
   "permission:allowAlways",
+  "permission:editInput",
   "scroll:pageUp",
   "scroll:pageDown",
   "scroll:top",
@@ -114,6 +125,8 @@ export function getKeybindingContextPriority(
   switch (context) {
     case "Prompt":
       return 95;
+    case "PermissionEdit":
+      return 92;
     case "Confirmation":
       return 90;
     case "Autocomplete":

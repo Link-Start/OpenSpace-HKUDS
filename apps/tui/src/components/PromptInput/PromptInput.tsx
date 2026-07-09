@@ -10,10 +10,12 @@ import type { CompletionItem } from "./SlashCommandComplete.js";
 import { SlashCommandComplete } from "./SlashCommandComplete.js";
 import PromptInputFooter from "./PromptInputFooter.js";
 import { PromptInputModeIndicator } from "./PromptInputModeIndicator.js";
+import { estimateWrappedRows } from "../../utils/textWidth.js";
 
 type Props = {
   value: string;
   disabled: boolean;
+  disabledReason?: string;
   busy?: boolean;
   inputMode: InputMode;
   vimMode?: VimMode;
@@ -24,6 +26,7 @@ type Props = {
   showSuggestions?: boolean;
   renderSuggestionsInline?: boolean;
   publishSuggestionsOverlay?: boolean;
+  maxInputRows?: number;
   sandbox?: SandboxStatusData;
 };
 
@@ -35,12 +38,24 @@ function renderWithCursor(
   value: string,
   cursorOffset: number,
   disabled: boolean,
+  maxVisibleChars?: number,
 ): React.ReactElement {
-  const boundedOffset = clamp(cursorOffset, 0, value.length);
-  const before = value.slice(0, boundedOffset);
-  const cursor = value[boundedOffset] ?? " ";
+  const visibleWindow = createVisibleInputWindow(
+    value,
+    cursorOffset,
+    maxVisibleChars,
+  );
+  const boundedOffset = clamp(
+    visibleWindow.cursorOffset,
+    0,
+    visibleWindow.value.length,
+  );
+  const before = visibleWindow.value.slice(0, boundedOffset);
+  const cursor = visibleWindow.value[boundedOffset] ?? " ";
   const after =
-    boundedOffset < value.length ? value.slice(boundedOffset + 1) : "";
+    boundedOffset < visibleWindow.value.length
+      ? visibleWindow.value.slice(boundedOffset + 1)
+      : "";
 
   return (
     <Text>
@@ -51,9 +66,41 @@ function renderWithCursor(
   );
 }
 
+function createVisibleInputWindow(
+  value: string,
+  cursorOffset: number,
+  maxVisibleChars: number | undefined,
+): {
+  value: string;
+  cursorOffset: number;
+} {
+  if (!maxVisibleChars || value.length <= maxVisibleChars) {
+    return {
+      value,
+      cursorOffset,
+    };
+  }
+
+  const boundedOffset = clamp(cursorOffset, 0, value.length);
+  const windowSize = Math.max(10, maxVisibleChars - 6);
+  const start = clamp(
+    boundedOffset - Math.floor(windowSize * 0.75),
+    0,
+    Math.max(0, value.length - windowSize),
+  );
+  const end = Math.min(value.length, start + windowSize);
+  const prefix = start > 0 ? "..." : "";
+  const suffix = end < value.length ? "..." : "";
+  return {
+    value: `${prefix}${value.slice(start, end)}${suffix}`,
+    cursorOffset: prefix.length + boundedOffset - start,
+  };
+}
+
 export default function PromptInput({
   value,
   disabled,
+  disabledReason,
   busy = false,
   inputMode,
   vimMode,
@@ -64,6 +111,7 @@ export default function PromptInput({
   showSuggestions = false,
   renderSuggestionsInline = true,
   publishSuggestionsOverlay = true,
+  maxInputRows = 4,
   sandbox,
 }: Props): React.ReactElement {
   const terminalSize = useTerminalSize();
@@ -80,7 +128,19 @@ export default function PromptInput({
     suggestions.length > 0;
   const emptyPlaceholder =
     placeholder ??
-    (disabled ? "Waiting for the current task..." : "Type a prompt and press Enter");
+    (disabled
+      ? disabledReason ?? "Input is temporarily unavailable"
+      : "Type a prompt and press Enter");
+  const inputColumns = Math.max(10, terminalSize.columns - 8);
+  const inputRows = value
+    ? Math.max(
+        1,
+        Math.min(maxInputRows, estimateWrappedRows(value, inputColumns)),
+      )
+    : 1;
+  const maxVisibleInputChars = value
+    ? Math.max(20, inputColumns * maxInputRows - 6)
+    : undefined;
 
   useRegisterOverlay("autocomplete", shouldRenderOverlay);
   useSetPromptOverlay(
@@ -112,9 +172,20 @@ export default function PromptInput({
           disabled={disabled}
           vimMode={vimMode}
         />
-        <Box flexDirection="column" flexGrow={1} flexShrink={1}>
+        <Box
+          flexDirection="column"
+          flexGrow={1}
+          flexShrink={1}
+          height={inputRows}
+          overflowY="hidden"
+        >
           {value ? (
-            renderWithCursor(value, cursorOffset, disabled)
+            renderWithCursor(
+              value,
+              cursorOffset,
+              disabled,
+              maxVisibleInputChars,
+            )
           ) : (
             <Text color="gray" wrap="truncate">{emptyPlaceholder}</Text>
           )}
@@ -134,6 +205,7 @@ export default function PromptInput({
 
       <PromptInputFooter
         disabled={disabled}
+        disabledReason={disabledReason}
         busy={busy}
         inputMode={inputMode}
         vimMode={vimMode}

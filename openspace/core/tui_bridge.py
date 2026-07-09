@@ -1149,12 +1149,12 @@ class TUIBridge:
         if TUIBridge.running_from_source_checkout():
             return (
                 "Build the source TUI with `npm --prefix apps/tui run build`, "
-                "or run with --no-tui."
+                "or run without --tui."
             )
         return (
             "The packaged TUI artifact is missing. Reinstall OpenSpace from a "
             "package built with `npm --prefix apps/tui run build:packaged`, or "
-            "run with --no-tui."
+            "run without --tui."
         )
 
     @staticmethod

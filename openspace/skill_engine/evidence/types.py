@@ -34,6 +34,7 @@ ALLOWED_REF_TYPES: frozenset[str] = frozenset(
         "admission_result_ref",
         "evolution_candidate_ref",
         "validation_result_ref",
+        "behavior_eval_result_ref",
         "authoring_result_ref",
         "evolution_action_ref",
         "memory_ref",

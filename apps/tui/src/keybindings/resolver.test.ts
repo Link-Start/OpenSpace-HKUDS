@@ -66,7 +66,6 @@ test("resolveKeyWithChordState prioritizes autocomplete bindings", () => {
   const bindings = parseBindings(DEFAULT_BINDINGS);
   for (const [input, key, action] of [
     ["", createKey({ tab: true }), "autocomplete:accept"],
-    ["", createKey({ return: true }), "autocomplete:accept"],
     ["", createKey({ upArrow: true }), "autocomplete:previous"],
     ["", createKey({ downArrow: true }), "autocomplete:next"],
   ] as const) {
@@ -80,6 +79,17 @@ test("resolveKeyWithChordState prioritizes autocomplete bindings", () => {
 
     assert.deepEqual(result, { type: "match", action });
   }
+
+  assert.deepEqual(
+    resolveKeyWithChordState(
+      "",
+      createKey({ return: true }),
+      ["Autocomplete", "Chat", "Global"],
+      bindings,
+      null,
+    ),
+    { type: "match", action: "chat:submit" },
+  );
 });
 
 test("prompt context leaves confirmation shortcuts available for text input", () => {
@@ -90,6 +100,7 @@ test("prompt context leaves confirmation shortcuts available for text input", ()
     ["y", createKey()],
     ["n", createKey()],
     ["a", createKey()],
+    ["3", createKey()],
     ["", createKey({ return: true })],
     ["", createKey({ escape: true })],
   ] as const) {
@@ -102,6 +113,66 @@ test("prompt context leaves confirmation shortcuts available for text input", ()
   assert.ok(
     getKeybindingContextPriority("Prompt") >
       getKeybindingContextPriority("Confirmation"),
+  );
+});
+
+test("confirmation digit shortcuts select explicit option slots", () => {
+  const bindings = parseBindings(DEFAULT_BINDINGS);
+
+  assert.deepEqual(
+    resolveKeyWithChordState(
+      "3",
+      createKey(),
+      ["Confirmation", "Global"],
+      bindings,
+      null,
+    ),
+    { type: "match", action: "confirm:digit3" },
+  );
+});
+
+test("permission edit context unbinds text shortcuts for raw JSON editing", () => {
+  const bindings = parseBindings(DEFAULT_BINDINGS);
+
+  assert.deepEqual(
+    resolveKeyWithChordState(
+      "y",
+      createKey(),
+      ["PermissionEdit", "Confirmation", "Global"],
+      bindings,
+      null,
+    ),
+    { type: "unbound" },
+  );
+  assert.deepEqual(
+    resolveKeyWithChordState(
+      "e",
+      createKey(),
+      ["Confirmation", "Global"],
+      bindings,
+      null,
+    ),
+    { type: "match", action: "permission:editInput" },
+  );
+  assert.deepEqual(
+    resolveKeyWithChordState(
+      "e",
+      createKey(),
+      ["PermissionEdit", "Confirmation", "Global"],
+      bindings,
+      null,
+    ),
+    { type: "unbound" },
+  );
+  assert.deepEqual(
+    resolveKeyWithChordState(
+      "",
+      createKey({ return: true }),
+      ["PermissionEdit", "Confirmation", "Global"],
+      bindings,
+      null,
+    ),
+    { type: "match", action: "confirm:yes" },
   );
 });
 

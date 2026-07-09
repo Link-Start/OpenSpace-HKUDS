@@ -72,8 +72,8 @@ def format_task_result(result: Dict[str, Any] | ExecutionResult) -> Dict[str, An
         if names:
             output["action_required"] = (
                 f"OpenSpace auto-evolved {len(names)} skill(s): {', '.join(names)}. "
-                "Follow the 'When to upload' rules in your delegate-task skill to "
-                "decide visibility, then upload via upload_skill. "
+                "Upload with the default private visibility unless the user explicitly "
+                "asks to share publicly. "
                 "Tell the user what you evolved and what you uploaded."
             )
 

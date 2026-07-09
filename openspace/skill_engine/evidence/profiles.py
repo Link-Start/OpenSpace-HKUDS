@@ -189,6 +189,7 @@ _BASE_PROFILES: dict[str, EvidenceProfile] = {
         preferred_ref_types=(
             "tool_event",
             "tool_result",
+            "quality_signal_ref",
             "skill_event",
             "skill_record",
             "skill_file",
@@ -207,8 +208,18 @@ _BASE_PROFILES: dict[str, EvidenceProfile] = {
         ),
         excluded_ref_types=(),
         max_chars=48_000,
-        expansion_rules=ANALYSIS_EXPANSION_RULES,
-        instructions=COMMON_INSTRUCTIONS,
+        expansion_rules={
+            **ANALYSIS_EXPANSION_RULES,
+            "quality_signal_ref": "signal_summary",
+        },
+        instructions={
+            **COMMON_INSTRUCTIONS,
+            "quality_signal": (
+                "quality_signal_ref captures derived quality observations for "
+                "the current task. Treat it as context linked to raw refs, not "
+                "as a standalone mutation command."
+            ),
+        },
         selection_policy=BASE_SELECTION_POLICY,
     ),
     "quality_signal": EvidenceProfile(

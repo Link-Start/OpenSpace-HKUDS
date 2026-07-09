@@ -1,6 +1,8 @@
 import React from "react";
 import { Box, Text } from "ink";
 import { useShortcutDisplay } from "../../keybindings/useShortcutDisplay.js";
+import { useTerminalSize } from "../../hooks/useTerminalSize.js";
+import { truncateToDisplayWidth } from "../../utils/textWidth.js";
 
 type Props = {
   messageCount: number;
@@ -23,6 +25,7 @@ export function TranscriptModeFooter({
   selectedMessageLabel = null,
   restoreAvailable = false,
 }: Props): React.ReactElement {
+  const { columns } = useTerminalSize();
   const exitShortcut = useShortcutDisplay(
     "app:toggleTranscript",
     "Global",
@@ -113,6 +116,7 @@ export function TranscriptModeFooter({
     `${exportShortcut} export`,
     `${editorShortcut} editor`,
   ].filter((segment): segment is string => segment !== null);
+  const safeContentWidth = Math.max(20, columns - 4);
 
   return (
     <Box
@@ -120,10 +124,12 @@ export function TranscriptModeFooter({
       borderColor="cyan"
       paddingX={1}
       height={3}
+      width="100%"
       overflowY="hidden"
+      overflowX="hidden"
     >
       <Text color="gray" wrap="truncate">
-        {statusSegments.join(" | ")}
+        {truncateToDisplayWidth(statusSegments.join(" | "), safeContentWidth)}
       </Text>
     </Box>
   );

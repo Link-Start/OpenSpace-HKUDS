@@ -2,8 +2,8 @@
 """Upload a skill to the OpenSpace cloud platform.
 
 Usage:
-    openspace-upload-skill --skill-dir ./my-skill --visibility public --origin imported --package-id <uuid>
-    openspace-upload-skill --skill-dir ./my-skill --visibility public --origin imported --parent-package-id <uuid> --new-package-segment "Browser automation"
+    openspace-upload-skill --skill-dir ./my-skill --origin imported --package-id <uuid>
+    openspace-upload-skill --skill-dir ./my-skill --origin imported --parent-package-id <uuid> --new-package-segment "Browser automation"
     openspace-upload-skill --skill-dir ./my-skill --visibility private --origin fix --parent-cloud-ids "<cloud_skill_uuid>"
 """
 
@@ -26,7 +26,7 @@ def main() -> None:
         description="Upload a skill to OpenSpace's cloud community",
     )
     parser.add_argument("--skill-dir", required=True, help="Path to skill directory (must contain SKILL.md)")
-    parser.add_argument("--visibility", required=True, choices=["public", "private"])
+    parser.add_argument("--visibility", default="private", choices=["public", "private"])
     parser.add_argument(
         "--origin",
         default="imported",

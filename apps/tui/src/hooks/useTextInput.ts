@@ -92,6 +92,10 @@ function hasChunkEditingInput(input: string): boolean {
   );
 }
 
+function getChunkSubmitIndex(input: string): number {
+  return input.indexOf("\r");
+}
+
 function applyPlainInputChunk(
   text: string,
   offset: number,
@@ -241,6 +245,21 @@ export function useTextInput({
       const currentOffset = cursorOffsetRef.current;
 
       if (!focus) {
+        return;
+      }
+
+      const chunkSubmitIndex = handleSubmitKeys && !key.return
+        ? getChunkSubmitIndex(rawInput)
+        : -1;
+      if (chunkSubmitIndex >= 0) {
+        const beforeSubmit = rawInput.slice(0, chunkSubmitIndex);
+        const next = beforeSubmit
+          ? applyPlainInputChunk(currentValue, currentOffset, beforeSubmit)
+          : {
+              value: currentValue,
+              offset: currentOffset,
+            };
+        onSubmit?.(next.value);
         return;
       }
 

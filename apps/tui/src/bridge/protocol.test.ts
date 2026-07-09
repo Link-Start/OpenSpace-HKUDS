@@ -97,6 +97,7 @@ test("event type runtime lists match the shared manifest", () => {
   assert.deepEqual([...TUI_TO_CORE_MSG_TYPES], manifest.tui_to_core);
   assert.deepEqual([...CORE_TO_TUI_MSG_TYPES], manifest.core_to_tui);
   assert.equal(isKnownEventType("tool_permission_ask"), true);
+  assert.equal(isKnownEventType("bash_tool_command_executed"), true);
   assert.equal(isKnownEventType("background_housekeeping_idle"), true);
   assert.equal(
     isKnownEventType("background_housekeeping_cleanup_complete"),

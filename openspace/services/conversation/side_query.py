@@ -481,6 +481,7 @@ async def _call_side_model(
         "tool_prompt_context": context.tool_context,
         **context.call_model_kwargs,
     }
+    kwargs.setdefault("emit_events", False)
     if effective_model:
         kwargs["model"] = effective_model
     if context.max_tokens is not None:

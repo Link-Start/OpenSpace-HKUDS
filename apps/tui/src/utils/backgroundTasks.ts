@@ -1,6 +1,8 @@
 import type { BackgroundAgentTaskState } from "../state/AppStateStore.js";
 
 const TERMINAL_STATUSES = new Set([
+  "cancelled",
+  "canceled",
   "completed",
   "failed",
   "killed",

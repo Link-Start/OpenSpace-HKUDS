@@ -210,6 +210,16 @@ def _json_list_from_row(row: sqlite3.Row, key: str) -> list[str]:
     return [str(item) for item in loaded if str(item)]
 
 
+def _json_object_from_row(row: sqlite3.Row, key: str) -> dict[str, Any]:
+    if key not in row.keys():
+        return {}
+    try:
+        loaded = json.loads(row[key] or "{}")
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return {}
+    return dict(loaded) if isinstance(loaded, dict) else {}
+
+
 def _category_for_meta_locked(conn: sqlite3.Connection, meta: Any) -> SkillCategory:
     """Resolve local/cloud classification for a discovered skill."""
 
@@ -295,11 +305,15 @@ CREATE TABLE IF NOT EXISTS skill_records (
     visibility             TEXT NOT NULL DEFAULT 'private',
     creator_id             TEXT NOT NULL DEFAULT '',
     lineage_origin         TEXT NOT NULL DEFAULT 'imported',
+    lineage_revision_id    TEXT NOT NULL DEFAULT '',
     lineage_generation     INTEGER NOT NULL DEFAULT 0,
+    lineage_parent_revision_ids_json TEXT NOT NULL DEFAULT '[]',
     lineage_source_task_id TEXT,
     lineage_change_summary TEXT NOT NULL DEFAULT '',
+    lineage_content_hash   TEXT NOT NULL DEFAULT '',
     lineage_evolution_action_id TEXT,
     lineage_provenance_refs_json TEXT NOT NULL DEFAULT '[]',
+    lineage_revision_metadata_json TEXT NOT NULL DEFAULT '{}',
     lineage_content_diff   TEXT NOT NULL DEFAULT '',
     lineage_content_snapshot TEXT NOT NULL DEFAULT '{}',
     lineage_created_at     TEXT NOT NULL,
@@ -500,8 +514,28 @@ class SkillStore:
             )
             self._ensure_column_locked(
                 "skill_records",
+                "lineage_revision_id",
+                "TEXT NOT NULL DEFAULT ''",
+            )
+            self._ensure_column_locked(
+                "skill_records",
+                "lineage_parent_revision_ids_json",
+                "TEXT NOT NULL DEFAULT '[]'",
+            )
+            self._ensure_column_locked(
+                "skill_records",
+                "lineage_content_hash",
+                "TEXT NOT NULL DEFAULT ''",
+            )
+            self._ensure_column_locked(
+                "skill_records",
                 "lineage_provenance_refs_json",
                 "TEXT NOT NULL DEFAULT '[]'",
+            )
+            self._ensure_column_locked(
+                "skill_records",
+                "lineage_revision_metadata_json",
+                "TEXT NOT NULL DEFAULT '{}'",
             )
             self._ensure_column_locked(
                 "execution_analyses",
@@ -2094,20 +2128,30 @@ class SkillStore:
         provenance_refs_json = json.dumps(
             lin.provenance_refs, ensure_ascii=False
         )
+        parent_revision_ids_json = json.dumps(
+            lin.parent_revision_ids or lin.parent_skill_ids,
+            ensure_ascii=False,
+        )
+        revision_metadata_json = json.dumps(
+            lin.revision_metadata,
+            ensure_ascii=False,
+        )
         self._conn.execute(
             """
             INSERT INTO skill_records (
                 skill_id, name, description, path, is_active, category,
                 visibility, creator_id,
-                lineage_origin, lineage_generation,
-                lineage_source_task_id, lineage_change_summary,
+                lineage_origin, lineage_revision_id, lineage_generation,
+                lineage_parent_revision_ids_json, lineage_source_task_id,
+                lineage_change_summary, lineage_content_hash,
                 lineage_evolution_action_id, lineage_provenance_refs_json,
-                lineage_content_diff, lineage_content_snapshot,
+                lineage_revision_metadata_json, lineage_content_diff,
+                lineage_content_snapshot,
                 lineage_created_at, lineage_created_by,
                 total_selections, total_applied,
                 total_completions, total_fallbacks,
                 first_seen, last_updated
-            ) VALUES (?,?,?,?,?,?, ?,?, ?,?, ?,?, ?,?, ?,?, ?,?, ?,?,?,?, ?,?)
+            ) VALUES (?,?,?,?,?,?, ?,?, ?,?,?,?, ?,?,?,?, ?,?,?,?, ?,?, ?,?,?,?, ?,?)
             ON CONFLICT(skill_id) DO UPDATE SET
                 name=excluded.name,
                 description=excluded.description,
@@ -2117,11 +2161,15 @@ class SkillStore:
                 visibility=excluded.visibility,
                 creator_id=excluded.creator_id,
                 lineage_origin=excluded.lineage_origin,
+                lineage_revision_id=excluded.lineage_revision_id,
                 lineage_generation=excluded.lineage_generation,
+                lineage_parent_revision_ids_json=excluded.lineage_parent_revision_ids_json,
                 lineage_source_task_id=excluded.lineage_source_task_id,
                 lineage_change_summary=excluded.lineage_change_summary,
+                lineage_content_hash=excluded.lineage_content_hash,
                 lineage_evolution_action_id=excluded.lineage_evolution_action_id,
                 lineage_provenance_refs_json=excluded.lineage_provenance_refs_json,
+                lineage_revision_metadata_json=excluded.lineage_revision_metadata_json,
                 lineage_content_diff=excluded.lineage_content_diff,
                 lineage_content_snapshot=excluded.lineage_content_snapshot,
                 lineage_created_at=excluded.lineage_created_at,
@@ -2142,11 +2190,15 @@ class SkillStore:
                 record.visibility.value,
                 record.creator_id,
                 lin.origin.value,
+                lin.revision_id or record.skill_id,
                 lin.generation,
+                parent_revision_ids_json,
                 lin.source_task_id,
                 lin.change_summary,
+                lin.content_hash,
                 lin.evolution_action_id,
                 provenance_refs_json,
+                revision_metadata_json,
                 lin.content_diff,
                 snapshot_json,
                 lin.created_at.isoformat(),
@@ -2273,10 +2325,24 @@ class SkillStore:
 
         lineage = SkillLineage(
             origin=SkillOrigin(row["lineage_origin"]),
+            revision_id=(
+                row["lineage_revision_id"]
+                if "lineage_revision_id" in row.keys()
+                else sid
+            ) or sid,
             generation=row["lineage_generation"],
             parent_skill_ids=parents,
+            parent_revision_ids=_json_list_from_row(
+                row,
+                "lineage_parent_revision_ids_json",
+            ) or parents,
             source_task_id=row["lineage_source_task_id"],
             change_summary=row["lineage_change_summary"],
+            content_hash=(
+                row["lineage_content_hash"]
+                if "lineage_content_hash" in row.keys()
+                else ""
+            ),
             content_diff=row["lineage_content_diff"],
             content_snapshot=snapshot,
             evolution_action_id=(
@@ -2287,6 +2353,10 @@ class SkillStore:
             provenance_refs=_json_list_from_row(
                 row,
                 "lineage_provenance_refs_json",
+            ),
+            revision_metadata=_json_object_from_row(
+                row,
+                "lineage_revision_metadata_json",
             ),
             created_at=datetime.fromisoformat(row["lineage_created_at"]),
             created_by=row["lineage_created_by"],

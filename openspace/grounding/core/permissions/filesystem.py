@@ -1401,6 +1401,13 @@ def check_read_permission_for_tool(
                 decision_reason=DecisionReasonRule(rule=deny_rule),
             )
 
+    # OS-extension: runtime-owned internal files, such as background task
+    # stdout under the session task directory, must remain readable even when
+    # their parent lives under ``.openspace``. Keep explicit deny rules above.
+    internal = check_readable_internal_path(expand_path(input_path), None)
+    if not isinstance(internal, PermissionPassthrough):
+        return internal
+
     # OS-extension — sensitive paths force an ask even when the user
     # has installed a permissive read rule.
     for p in paths_to_check:

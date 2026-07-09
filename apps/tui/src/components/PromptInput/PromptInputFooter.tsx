@@ -8,6 +8,7 @@ import { sandboxHint } from "../../utils/sandboxPromptFooter.js";
 
 type Props = {
   disabled: boolean;
+  disabledReason?: string;
   busy?: boolean;
   inputMode: InputMode;
   vimMode?: VimMode;
@@ -17,6 +18,7 @@ type Props = {
 
 export default function PromptInputFooter({
   disabled,
+  disabledReason,
   busy = false,
   inputMode,
   vimMode,
@@ -48,7 +50,7 @@ export default function PromptInputFooter({
   );
 
   let hint = disabled
-    ? "Waiting for the current task to finish"
+    ? disabledReason ?? "Input is temporarily unavailable"
     : busy
       ? `Task running | ${cancelShortcut} cancel`
       : `${submitShortcut} send | ${newlineShortcut} newline | ${cancelShortcut} cancel`;
@@ -64,19 +66,22 @@ export default function PromptInputFooter({
   }
   const sandboxStatus = sandboxHint(sandbox);
 
+  const vimStatus = vimMode ? `vim ${vimMode}` : null;
+
   return (
-    <Box marginTop={1} width="100%" height={2} justifyContent="space-between">
-      <Box flexDirection="column" flexGrow={1} flexShrink={1}>
-        <Text color="gray" wrap="truncate">{hint}</Text>
-        {sandboxStatus ? (
-          <Text color={sandboxStatus.color} wrap="truncate">
-            {sandboxStatus.text}
-          </Text>
-        ) : (
-          <Text> </Text>
-        )}
-      </Box>
-      {vimMode ? <Text color="gray">vim {vimMode}</Text> : null}
+    <Box marginTop={1} width="100%" height={2} flexDirection="column">
+      <Text color="gray" wrap="truncate">{hint}</Text>
+      {sandboxStatus || vimStatus ? (
+        <Text wrap="truncate">
+          {sandboxStatus ? (
+            <Text color={sandboxStatus.color}>{sandboxStatus.text}</Text>
+          ) : null}
+          {sandboxStatus && vimStatus ? <Text color="gray"> | </Text> : null}
+          {vimStatus ? <Text color="gray">{vimStatus}</Text> : null}
+        </Text>
+      ) : (
+        <Text> </Text>
+      )}
     </Box>
   );
 }

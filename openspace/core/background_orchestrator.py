@@ -31,6 +31,7 @@ BACKGROUND_SINK_EVENT_TYPES = RUNTIME_EVENT_TYPES | {
     "agent_list",
     "agent_event",
     "agent_transcript",
+    "status_update",
 }
 
 

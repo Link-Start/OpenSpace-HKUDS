@@ -3,6 +3,7 @@ import json
 import asyncio
 import inspect
 import os
+import re
 import time
 from types import SimpleNamespace
 from typing import Any, Callable, List, Sequence, Union, Dict, Optional, Mapping
@@ -30,6 +31,7 @@ from .effort import (
     get_effort_config,
 )
 from .thinking import (
+    ThinkingConfig,
     build_thinking_request_params,
     get_model_max_output_tokens,
     get_thinking_config,
@@ -63,6 +65,307 @@ from .errors import (
 logger = Logger.get_logger(__name__)
 
 
+def _usage_has_counts(usage: TokenUsage) -> bool:
+    return any(
+        int(getattr(usage, attr, 0) or 0) > 0
+        for attr in (
+            "input_tokens",
+            "output_tokens",
+            "total_tokens",
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+            "reasoning_tokens",
+        )
+    ) or float(getattr(usage, "cost", 0.0) or 0.0) > 0
+
+
+def _estimate_missing_usage(
+    *,
+    model: str,
+    input_messages: Sequence[Mapping[str, Any]],
+    output_text: str,
+) -> TokenUsage:
+    try:
+        from openspace.services.conversation.compact import estimate_message_tokens
+
+        input_tokens = int(estimate_message_tokens(input_messages, model=model))
+        output_tokens = int(
+            estimate_message_tokens(
+                [{"role": "assistant", "content": output_text}],
+                model=model,
+            )
+        )
+    except Exception:
+        input_tokens = max(1, len(json.dumps(list(input_messages), ensure_ascii=False).encode("utf-8")) // 4)
+        output_tokens = max(1, len(output_text.encode("utf-8")) // 4)
+
+    output_tokens = max(1 if output_text else 0, output_tokens)
+    return TokenUsage(
+        input_tokens=max(0, input_tokens),
+        output_tokens=output_tokens,
+        total_tokens=max(0, input_tokens) + output_tokens,
+    )
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _is_official_deepseek_model(model: str) -> bool:
+    normalized = str(model or "").strip().lower()
+    return normalized.startswith("deepseek/") or normalized.startswith("deepseek-")
+
+
+def _supports_required_tool_choice(
+    model: str,
+    *,
+    deepseek_thinking_disabled: bool = False,
+) -> bool:
+    """Return whether the provider accepts API-level required tool choice."""
+
+    if _env_bool("OPENSPACE_ALLOW_DEEPSEEK_REQUIRED_TOOL_CHOICE", False):
+        return True
+    if _is_official_deepseek_model(model) and not deepseek_thinking_disabled:
+        return False
+    return True
+
+
+def _deepseek_thinking_mode_from_env() -> str | None:
+    raw = (
+        os.environ.get("OPENSPACE_DEEPSEEK_THINKING")
+        or os.environ.get("OPENSPACE_DEEPSEEK_THINKING_MODE")
+    )
+    if raw is None:
+        return None
+    normalized = raw.strip().lower().replace("_", "-")
+    aliases = {
+        "": None,
+        "auto": None,
+        "default": None,
+        "enabled": "enabled",
+        "enable": "enabled",
+        "on": "enabled",
+        "thinking": "enabled",
+        "disabled": "disabled",
+        "disable": "disabled",
+        "off": "disabled",
+        "non-thinking": "disabled",
+        "nonthinking": "disabled",
+    }
+    if normalized not in aliases:
+        logger.warning(
+            "Ignoring invalid OPENSPACE_DEEPSEEK_THINKING value: %s",
+            raw,
+        )
+    return aliases.get(normalized)
+
+
+def _deepseek_request_params(model: str, *, tool_choice: str) -> dict[str, Any]:
+    """Build DeepSeek-specific request controls when explicitly configured."""
+
+    if not _is_official_deepseek_model(model):
+        return {}
+
+    mode = _deepseek_thinking_mode_from_env()
+    if (
+        mode is None
+        and tool_choice == "required"
+        and _env_bool(
+            "OPENSPACE_DEEPSEEK_DISABLE_THINKING_ON_REQUIRED_TOOL_CHOICE",
+            False,
+        )
+    ):
+        mode = "disabled"
+
+    params: dict[str, Any] = {}
+    if mode in {"enabled", "disabled"}:
+        params["extra_body"] = {"thinking": {"type": mode}}
+
+    effort = os.environ.get("OPENSPACE_DEEPSEEK_REASONING_EFFORT")
+    if effort and effort.strip() and mode != "disabled":
+        params["reasoning_effort"] = effort.strip().lower()
+    return params
+
+
+def _deepseek_thinking_disabled(params: Mapping[str, Any]) -> bool:
+    extra_body = params.get("extra_body")
+    if not isinstance(extra_body, Mapping):
+        return False
+    thinking = extra_body.get("thinking")
+    return (
+        isinstance(thinking, Mapping)
+        and str(thinking.get("type") or "").strip().lower() == "disabled"
+    )
+
+
+def _disable_reasoning_on_required_tool_choice(model: str) -> bool:
+    """Return whether required-tool recovery calls should suppress reasoning."""
+
+    if _env_bool("OPENSPACE_DISABLE_REASONING_ON_REQUIRED_TOOL_CHOICE", False):
+        return True
+    normalized = str(model or "").strip().lower()
+    if normalized.startswith("openrouter/"):
+        return _env_bool(
+            "OPENSPACE_OPENROUTER_DISABLE_REASONING_ON_REQUIRED_TOOL_CHOICE",
+            False,
+        )
+    return False
+
+
+def _required_tool_choice_reasoning_disabled_params(model: str) -> dict[str, Any]:
+    """Provider-specific params that actively disable reasoning for tool recovery."""
+
+    normalized = str(model or "").strip().lower()
+    if normalized.startswith("openrouter/"):
+        return {"reasoning": {"effort": "none", "exclude": True}}
+    return {}
+
+
+def _decode_jsonish_string(value: str) -> str:
+    """Decode the small escape subset models commonly use in malformed JSON."""
+
+    return (
+        value.replace("\\r\\n", "\n")
+        .replace("\\n", "\n")
+        .replace("\\r", "\r")
+        .replace("\\t", "\t")
+        .replace('\\"', '"')
+        .replace("\\/", "/")
+        .replace("\\\\", "\\")
+    )
+
+
+def _extract_jsonish_string_field(
+    raw: str,
+    field_names: Sequence[str],
+    *,
+    greedy: bool = False,
+) -> str | None:
+    """Extract a JSON string field from malformed model-emitted arguments."""
+
+    for field_name in field_names:
+        match = re.search(rf'"{re.escape(field_name)}"\s*:\s*"', raw)
+        if not match:
+            continue
+        start = match.end()
+        if greedy:
+            end = raw.rfind('"')
+            if end > start:
+                return _decode_jsonish_string(raw[start:end])
+            return None
+
+        index = start
+        escaped = False
+        while index < len(raw):
+            char = raw[index]
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                return _decode_jsonish_string(raw[start:index])
+            index += 1
+    return None
+
+
+def _salvage_malformed_write_arguments(
+    raw_arguments: str,
+    tool_name: str,
+) -> dict[str, Any] | None:
+    """Recover common huge ``write`` calls whose JSON string was not escaped."""
+
+    if tool_name != "write":
+        return None
+    file_path = _extract_jsonish_string_field(
+        raw_arguments,
+        ("file_path", "path", "filename"),
+    )
+    content = _extract_jsonish_string_field(
+        raw_arguments,
+        ("content",),
+        greedy=True,
+    )
+    if not file_path or content is None:
+        return None
+    return {"file_path": file_path, "content": content}
+
+
+def _text_tool_call(
+    *,
+    name: str,
+    arguments: Mapping[str, Any],
+    index: int = 0,
+) -> Dict[str, Any]:
+    return {
+        "id": f"call_text_{index}",
+        "type": "function",
+        "function": {
+            "name": name,
+            "arguments": json.dumps(dict(arguments), ensure_ascii=False),
+        },
+    }
+
+
+def _parse_text_tool_calls(
+    content: str,
+    tool_map: Mapping[str, BaseTool],
+) -> list[Dict[str, Any]]:
+    if not _env_bool("OPENSPACE_PARSE_TEXT_TOOL_CALLS") or not content:
+        return []
+
+    function_match = re.search(
+        r"<function=([A-Za-z0-9_.-]+)>(.*?)</function>",
+        content,
+        flags=re.DOTALL,
+    )
+    if function_match:
+        tool_name = function_match.group(1).strip()
+        body = function_match.group(2)
+        if tool_name in tool_map:
+            arguments: dict[str, Any] = {}
+            for param_match in re.finditer(
+                r"<parameter=([A-Za-z0-9_.-]+)>(.*?)</parameter>",
+                body,
+                flags=re.DOTALL,
+            ):
+                arguments[param_match.group(1).strip()] = param_match.group(2).strip()
+            if arguments:
+                return [_text_tool_call(name=tool_name, arguments=arguments)]
+
+    json_blocks = re.findall(
+        r"```(?:json)?\s*(\{.*?\})\s*```",
+        content,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    stripped = content.strip()
+    if not json_blocks and stripped.startswith("{") and stripped.endswith("}"):
+        json_blocks = [stripped]
+
+    for block in json_blocks:
+        try:
+            payload = json.loads(block)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        command = payload.get("command")
+        if isinstance(command, str) and command.strip() and "bash" in tool_map:
+            arguments = {"command": command.strip()}
+            description = payload.get("description")
+            if isinstance(description, str) and description.strip():
+                arguments["description"] = description.strip()
+            return [_text_tool_call(name="bash", arguments=arguments)]
+        name = payload.get("name") or payload.get("tool")
+        arguments = payload.get("arguments") or payload.get("parameters")
+        if isinstance(name, str) and name in tool_map and isinstance(arguments, dict):
+            return [_text_tool_call(name=name, arguments=arguments)]
+
+    return []
+
+
 def _merge_completion_kwargs(
     target: Dict[str, Any],
     updates: Mapping[str, Any],
@@ -90,6 +393,19 @@ def _merge_completion_kwargs(
             target[key] = merged
         else:
             target[key] = value
+
+
+def _ensure_stream_usage_options(target: Dict[str, Any]) -> None:
+    """Ask OpenAI-compatible streaming providers to include final usage stats."""
+
+    stream_options = target.get("stream_options")
+    if stream_options is None:
+        target["stream_options"] = {"include_usage": True}
+        return
+    if isinstance(stream_options, Mapping):
+        options = dict(stream_options)
+        options.setdefault("include_usage", True)
+        target["stream_options"] = options
 
 
 def _serializable_effort_value(value: Any) -> str | int | None:
@@ -567,6 +883,7 @@ class LLMClient:
         stream: Any,
         *,
         abort_event: Optional[asyncio.Event] = None,
+        emit_events: bool = True,
     ) -> Any:
         content_parts: list[str] = []
         reasoning_parts: list[Any] = []
@@ -606,7 +923,11 @@ class LLMClient:
                 content_delta = self._response_field(delta, "content", None)
                 if isinstance(content_delta, str) and content_delta:
                     content_parts.append(content_delta)
-                    await self._emit_event("llm_token", {"token": content_delta})
+                    if emit_events:
+                        await self._emit_event(
+                            "llm_token",
+                            {"token": content_delta},
+                        )
 
                 reasoning_delta = self._stream_reasoning_delta(delta)
                 if reasoning_delta:
@@ -756,6 +1077,7 @@ class LLMClient:
         abort_event: Optional[asyncio.Event] = None,
         fallback_model: Optional[str] = None,
         thinking_budget_tokens: int = 0,
+        emit_events: bool = True,
         **completion_kwargs,
     ):
         """Call LLM with OpenSpace retry logic."""
@@ -782,6 +1104,7 @@ class LLMClient:
                         self._consume_streaming_completion(
                             response,
                             abort_event=abort_event,
+                            emit_events=emit_events,
                         ),
                         timeout=self.timeout,
                     )
@@ -875,13 +1198,14 @@ class LLMClient:
                     continue
 
                 # Compute delay
+                error_tag = classify_api_error(e)
                 retry_after = get_retry_after_ms(e)
                 if retry_after is not None:
                     delay_ms = retry_after
                 else:
                     delay_ms = get_retry_delay(attempt)
-
-                error_tag = classify_api_error(e)
+                if error_tag == "rate_limit" and self.rate_limit_delay > 0:
+                    delay_ms = max(delay_ms, int(self.rate_limit_delay * 1000))
                 self._logger.warning(
                     "%s error (attempt %d/%d), waiting %d ms before retry...",
                     error_tag, attempt, max_retries + 1, delay_ms,
@@ -893,14 +1217,15 @@ class LLMClient:
                     retry_attempt=attempt,
                     max_retries=max_retries,
                 )
-                await self._emit_event("llm_retry", {
-                    "attempt": attempt,
-                    "max_retries": max_retries,
-                    "delay_ms": delay_ms,
-                    "error_type": error_tag,
-                    "error_message": str(e)[:500],
-                    "system_message": retry_system_msg,
-                })
+                if emit_events:
+                    await self._emit_event("llm_retry", {
+                        "attempt": attempt,
+                        "max_retries": max_retries,
+                        "delay_ms": delay_ms,
+                        "error_type": error_tag,
+                        "error_message": str(e)[:500],
+                        "system_message": retry_system_msg,
+                    })
 
                 await asyncio.sleep(delay_ms / 1000)
 
@@ -935,6 +1260,52 @@ class LLMClient:
                 str(exc)[:200],
             )
             return {}
+
+    @staticmethod
+    def _sanitize_tool_arguments_for_history(
+        raw_arguments: str | None,
+        tool_name: str,
+    ) -> tuple[str, dict[str, Any], bool]:
+        """Return API-safe tool arguments and whether the model JSON was invalid."""
+        if not raw_arguments:
+            return "{}", {}, False
+        try:
+            parsed = json.loads(raw_arguments)
+            if isinstance(parsed, dict):
+                return raw_arguments, parsed, False
+            logger.warning(
+                "[TOOL_JSON] Tool '%s' arguments parsed to %s; "
+                "sanitizing history payload.",
+                tool_name,
+                type(parsed).__name__,
+            )
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            logger.warning(
+                "[TOOL_JSON] Failed to parse tool '%s' arguments "
+                "(len=%d): %s. Sanitizing history payload.",
+                tool_name,
+                len(raw_arguments),
+                str(exc)[:200],
+            )
+
+        salvaged = _salvage_malformed_write_arguments(raw_arguments, tool_name)
+        if salvaged is not None:
+            logger.warning(
+                "[TOOL_JSON] Recovered malformed '%s' arguments "
+                "(len=%d) for history/execution.",
+                tool_name,
+                len(raw_arguments),
+            )
+            return json.dumps(salvaged, ensure_ascii=False), salvaged, True
+
+        fallback = {
+            "__openspace_tool_argument_error": (
+                "The model emitted malformed tool-call JSON. Retry this tool "
+                "call with compact, valid JSON arguments."
+            ),
+            "raw_argument_chars": len(raw_arguments),
+        }
+        return json.dumps(fallback, ensure_ascii=False), fallback, True
 
     @staticmethod
     def _get_error_message_if_refusal(
@@ -1032,6 +1403,7 @@ class LLMClient:
                 - ``effort_config``: pre-resolved ``EffortConfig``
                 - ``tool_choice``: tool selection mode (default ``"auto"``)
                 - ``streaming``: enable provider token streaming (default ``True``)
+                - ``emit_events``: stream LLM UI events (default ``True``)
                 - Any other key is forwarded to ``litellm.acompletion``
 
         Returns:
@@ -1065,13 +1437,20 @@ class LLMClient:
         tool_prompt_context = kwargs.pop("tool_prompt_context", None)
         use_tool_schema_cache: bool = bool(kwargs.pop("use_tool_schema_cache", True))
         explicit_stream = kwargs.pop("stream", None)
+        explicit_streaming = kwargs.pop("streaming", None)
+        if explicit_streaming is None and "streaming" in self.litellm_kwargs:
+            explicit_streaming = self.litellm_kwargs.get("streaming")
+        if explicit_stream is None and "stream" in self.litellm_kwargs:
+            explicit_stream = self.litellm_kwargs.get("stream")
         streaming = bool(
-            kwargs.pop(
-                "streaming",
-                True if explicit_stream is None else explicit_stream,
-            )
+            explicit_streaming
+            if explicit_streaming is not None
+            else True if explicit_stream is None else explicit_stream
         )
+        emit_events = bool(kwargs.pop("emit_events", True))
         raw_max_tokens = kwargs.pop("max_tokens", None)
+        if raw_max_tokens is None:
+            raw_max_tokens = self.litellm_kwargs.get("max_tokens")
         try:
             max_tokens = int(raw_max_tokens) if raw_max_tokens is not None else None
         except (TypeError, ValueError):
@@ -1089,6 +1468,18 @@ class LLMClient:
                 use_schema_cache=use_tool_schema_cache,
             )
 
+        disable_reasoning_for_required_tool = (
+            bool(llm_tools)
+            and tool_choice == "required"
+            and _disable_reasoning_on_required_tool_choice(request_model)
+        )
+        if disable_reasoning_for_required_tool:
+            enable_thinking = False
+            explicit_effort_config = None
+            explicit_thinking_config = ThinkingConfig.disabled(
+                source="required_tool_choice"
+            )
+
         if isinstance(explicit_effort_config, EffortConfig):
             effort_config = explicit_effort_config
         else:
@@ -1099,8 +1490,6 @@ class LLMClient:
             explicit_thinking_config is None
             and effort_config.thinking_budget_tokens is not None
         ):
-            from .thinking import ThinkingConfig
-
             explicit_thinking_config = ThinkingConfig.enabled(
                 effort_config.thinking_budget_tokens,
                 source=effort_config.source,
@@ -1122,6 +1511,10 @@ class LLMClient:
             max_output_tokens=max_tokens,
         )
         effort_params = build_effort_request_params(effort_config, request_model)
+        if disable_reasoning_for_required_tool:
+            thinking_params = {}
+            thinking_budget_tokens = 0
+            effort_params = {}
 
         # Build litellm completion kwargs
         completion_kwargs: Dict[str, Any] = {
@@ -1129,18 +1522,61 @@ class LLMClient:
             **self.litellm_kwargs,
             "max_tokens": max_tokens,
         }
+        completion_kwargs.pop("streaming", None)
         if streaming:
             completion_kwargs["stream"] = True
         else:
             completion_kwargs.pop("stream", None)
+        deepseek_params = _deepseek_request_params(
+            request_model,
+            tool_choice=tool_choice,
+        )
+        effective_tool_choice = tool_choice
+        if (
+            llm_tools
+            and tool_choice == "required"
+            and not _supports_required_tool_choice(
+                request_model,
+                deepseek_thinking_disabled=_deepseek_thinking_disabled(
+                    deepseek_params
+                ),
+            )
+        ):
+            effective_tool_choice = "auto"
+            logger.info(
+                "Downgrading tool_choice=required to auto for model %s because "
+                "the provider does not support required tool choice.",
+                request_model,
+            )
         if llm_tools:
             completion_kwargs["tools"] = llm_tools
-            completion_kwargs["tool_choice"] = tool_choice
+            completion_kwargs["tool_choice"] = effective_tool_choice
+        logger.info(
+            "LLM request controls: model=%s tools=%s tool_choice=%s requested_tool_choice=%s "
+            "disable_reasoning_for_required_tool=%s max_tokens=%s",
+            request_model,
+            len(llm_tools),
+            effective_tool_choice if llm_tools else "none",
+            tool_choice,
+            disable_reasoning_for_required_tool,
+            max_tokens,
+        )
         _merge_completion_kwargs(completion_kwargs, thinking_params)
         _merge_completion_kwargs(completion_kwargs, effort_params)
+        _merge_completion_kwargs(completion_kwargs, deepseek_params)
 
         # Forward remaining kwargs (e.g. max_tokens, temperature)
         _merge_completion_kwargs(completion_kwargs, kwargs)
+        if streaming:
+            _ensure_stream_usage_options(completion_kwargs)
+        if disable_reasoning_for_required_tool:
+            completion_kwargs.pop("reasoning", None)
+            completion_kwargs.pop("reasoning_effort", None)
+            completion_kwargs.pop("thinking", None)
+            _merge_completion_kwargs(
+                completion_kwargs,
+                _required_tool_choice_reasoning_disabled_params(request_model),
+            )
         if "thinking" in thinking_params:
             # Anthropic requires temperature=1/default whenever thinking is enabled.
             completion_kwargs.pop("temperature", None)
@@ -1167,18 +1603,19 @@ class LLMClient:
         await self._rate_limit()
 
         # Emit llm_start event
-        await self._emit_event("llm_start", {
-            "model": request_model,
-            "tool_count": len(llm_tools),
-            "enable_thinking": thinking_config.type != "disabled",
-            "thinking_type": thinking_config.type,
-            "thinking_budget_tokens": thinking_budget_tokens,
-            "thinking_source": thinking_config.source,
-            "effort": effective_effort,
-            "display_effort": effort_config.level.value,
-            "effort_source": effort_config.source,
-            "streaming": streaming,
-        })
+        if emit_events:
+            await self._emit_event("llm_start", {
+                "model": request_model,
+                "tool_count": len(llm_tools),
+                "enable_thinking": thinking_config.type != "disabled",
+                "thinking_type": thinking_config.type,
+                "thinking_budget_tokens": thinking_budget_tokens,
+                "thinking_source": thinking_config.source,
+                "effort": effective_effort,
+                "display_effort": effort_config.level.value,
+                "effort_source": effort_config.source,
+                "streaming": streaming,
+            })
 
         # Call LLM via _call_with_retry
         # Exceptions (PromptTooLongError, ModelNotAvailableError,
@@ -1187,6 +1624,7 @@ class LLMClient:
             abort_event=abort_event,
             fallback_model=fallback_model,
             thinking_budget_tokens=thinking_budget_tokens,
+            emit_events=emit_events,
             **completion_kwargs,
         )
 
@@ -1214,23 +1652,30 @@ class LLMClient:
         # Parse content & stop_reason
         content_text: str = response_message.content or ""
         stop_reason: str | None = getattr(choice, "finish_reason", None)
+        if not _usage_has_counts(usage) and content_text:
+            usage = _estimate_missing_usage(
+                model=request_model,
+                input_messages=api_messages,
+                output_text=content_text,
+            )
 
         # Emit tokens & llm_complete
         streamed = bool(getattr(response, "_openspace_streamed", False))
-        if not streamed:
+        if emit_events and not streamed:
             await self._emit_text_tokens(content_text)
-        await self._emit_event("llm_complete", {
-            "model": request_model,
-            "usage": {
+        if emit_events:
+            await self._emit_event("llm_complete", {
+                "model": request_model,
+                "usage": {
+                    "input_tokens": usage.input_tokens,
+                    "output_tokens": usage.output_tokens,
+                },
                 "input_tokens": usage.input_tokens,
                 "output_tokens": usage.output_tokens,
-            },
-            "input_tokens": usage.input_tokens,
-            "output_tokens": usage.output_tokens,
-            "content_length": len(content_text),
-            "stop_reason": stop_reason,
-            "streaming": streamed or streaming,
-        })
+                "content_length": len(content_text),
+                "stop_reason": stop_reason,
+                "streaming": streamed or streaming,
+            })
         await self._invoke_usage_callback(request_model, usage)
 
         # Build assistant_message (OpenAI format)
@@ -1258,22 +1703,43 @@ class LLMClient:
         # wire values here; tool_runtime.pipeline.execution owns parse/fallback.
         tool_calls_raw = getattr(response_message, "tool_calls", None)
         parsed_tool_calls: list[Dict[str, Any]] = []
+        malformed_tool_arguments: list[dict[str, Any]] = []
 
         if tool_calls_raw:
             for tc in tool_calls_raw:
                 tc_name = tc.function.name
-                # Validate/log malformed JSON early without changing wire shape.
-                self._safe_parse_tool_arguments(
-                    tc.function.arguments, tc_name,
+                (
+                    safe_arguments,
+                    _parsed_arguments,
+                    malformed_arguments,
+                ) = self._sanitize_tool_arguments_for_history(
+                    tc.function.arguments,
+                    tc_name,
                 )
+                if malformed_arguments:
+                    malformed_tool_arguments.append({
+                        "id": tc.id,
+                        "tool": tc_name,
+                        "raw_argument_chars": len(tc.function.arguments or ""),
+                    })
                 parsed_tool_calls.append({
                     "id": tc.id,
                     "type": "function",
                     "function": {
                         "name": tc_name,
-                        "arguments": tc.function.arguments,
+                        "arguments": safe_arguments,
                     },
                 })
+
+        if not parsed_tool_calls:
+            parsed_tool_calls = _parse_text_tool_calls(content_text, tool_map)
+            if parsed_tool_calls:
+                logger.info(
+                    "Parsed %d text tool call(s) from assistant content",
+                    len(parsed_tool_calls),
+                )
+
+        if parsed_tool_calls:
             assistant_message["tool_calls"] = parsed_tool_calls
 
         # Attach _meta to assistant_message
@@ -1298,6 +1764,10 @@ class LLMClient:
             "display_effort": effort_config.level.value,
             "effort_source": effort_config.source,
         }
+        if malformed_tool_arguments:
+            assistant_message["_meta"][
+                "malformed_tool_arguments"
+            ] = malformed_tool_arguments
 
         # Build output messages list
         # messages = normalized input + assistant response (+ optional

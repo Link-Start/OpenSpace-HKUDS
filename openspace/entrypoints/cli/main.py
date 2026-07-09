@@ -57,10 +57,11 @@ def _create_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument('--timeout', type=float, help='LLM API call timeout (seconds)')
     
     # UI arguments
-    parser.add_argument('--interactive', '-i', action='store_true', help='Force interactive mode')
+    parser.add_argument('--interactive', '-i', action='store_true', help='Force text interactive mode')
+    parser.add_argument('--tui', action='store_true', help='Use the TS TUI instead of the text input loop')
+    parser.add_argument('--no-tui', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--resume', action='store_true', help='Start the TUI on the resume screen')
     parser.add_argument('--doctor', action='store_true', help='Start the TUI on the doctor screen')
-    parser.add_argument('--no-tui', action='store_true', help='Use the text input loop instead of the TS TUI')
     parser.add_argument('--no-ui', action='store_true', help='Disable visualization UI')
     parser.add_argument('--ui-compact', action='store_true', help='Use compact UI layout')
     
@@ -223,6 +224,9 @@ def _load_config(args, *, quiet: bool = False) -> OpenSpaceConfig:
         cli_overrides['llm_timeout'] = args.timeout
     if args.log_level:
         cli_overrides['log_level'] = args.log_level
+    if quiet:
+        cli_overrides['log_to_console'] = False
+        cli_overrides['log_to_file'] = True
 
     try:
         from openspace.services.runtime_support.settings import get_setting
@@ -343,7 +347,7 @@ async def _initialize_openspace(
 
 
 def _should_use_tui(args) -> bool:
-    return not args.no_tui and not args.query and not args.interactive
+    return bool(args.tui or args.resume or args.doctor) and not args.query
 
 
 def _resolve_use_tui(args) -> bool:
@@ -358,41 +362,31 @@ def _resolve_use_tui(args) -> bool:
             "The TS TUI needs an interactive terminal because stdin/stdout are "
             "reserved for Core/TUI IPC, but no usable terminal device was found."
         )
-        if getattr(args, "doctor", False) or getattr(args, "resume", False):
-            raise RuntimeError(message)
-        if not sys.stdin.isatty():
-            raise RuntimeError(
-                f"{message} Run with --query for non-interactive execution."
-            )
-
-        print(
-            "TS TUI is not available in this terminal; falling back to the "
-            f"text input loop. {message}"
+        raise RuntimeError(
+            f"{message} Run without --tui for the text input loop, or use "
+            "--query for non-interactive execution."
         )
-        args.no_tui = True
-        return False
 
     searched = "\n".join(
         f"  - {path}" for path in TUIBridge.default_tui_entry_candidates()
     )
-    if getattr(args, "doctor", False) or getattr(args, "resume", False):
-        raise FileNotFoundError(
-            "The TS TUI is required for --doctor/--resume, but no TUI entry "
-            "was found.\nSearched default locations:\n"
-            f"{searched}\n{TUIBridge.default_tui_missing_hint()}"
-        )
-
-    print(
-        "TS TUI is not available; falling back to the text input loop. "
-        f"{TUIBridge.default_tui_missing_hint()}"
+    raise FileNotFoundError(
+        "The TS TUI was requested, but no TUI entry was found.\n"
+        "Searched default locations:\n"
+        f"{searched}\n{TUIBridge.default_tui_missing_hint()}"
     )
-    args.no_tui = True
-    return False
 
 
 async def main():
     parser = _create_argument_parser()
     args = parser.parse_args()
+    tui_options = bool(args.tui or args.resume or args.doctor)
+    if getattr(args, "no_tui", False) and args.tui:
+        parser.error("--no-tui cannot be combined with --tui")
+    if args.interactive and tui_options:
+        parser.error("--interactive cannot be combined with --tui, --resume, or --doctor")
+    if args.query and tui_options:
+        parser.error("--query cannot be combined with --tui, --resume, or --doctor")
     
     # Handle subcommands
     if args.command == 'refresh-cache':

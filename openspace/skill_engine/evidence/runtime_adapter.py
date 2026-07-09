@@ -18,6 +18,20 @@ from .types import EvidenceEvent, EvidenceScope, ResourceRef
 
 logger = Logger.get_logger(__name__)
 
+_ANALYSIS_TRIGGER_SUPPRESSED_STATUSES = {
+    "api_error",
+    "llm_error",
+    "model_error",
+}
+_ANALYSIS_TRIGGER_SUPPRESSED_TERMS = (
+    "api error",
+    "rate limit",
+    "rate_limit",
+    "429",
+    "openrouterexception",
+    "litellm.ratelimiterror",
+)
+
 _AGENT_EVIDENCE_EVENTS = {
     "agent_spawn",
     "agent_start",
@@ -179,6 +193,8 @@ class RuntimeEvidenceAdapter:
     ) -> None:
         trigger_engine = self._trigger_engine
         if trigger_engine is None or event.event_type != "task_session_persisted":
+            return
+        if _should_suppress_analysis_checkpoint(data, event):
             return
         try:
             trigger_engine.evaluate_checkpoint(
@@ -501,6 +517,43 @@ def _runtime_finish_metadata(data: Mapping[str, Any]) -> dict[str, Any]:
         "message_count": data.get("message_count"),
         "final_response_preview": str(final_response)[:500],
     }
+
+
+def _should_suppress_analysis_checkpoint(
+    data: Mapping[str, Any],
+    event: EvidenceEvent,
+) -> bool:
+    metadata = event.metadata if isinstance(event.metadata, Mapping) else {}
+    status = _lower_first_str(data, metadata, "status")
+    stop_reason = _lower_first_str(data, metadata, "stop_reason")
+    if (
+        status in _ANALYSIS_TRIGGER_SUPPRESSED_STATUSES
+        or stop_reason in _ANALYSIS_TRIGGER_SUPPRESSED_STATUSES
+    ):
+        return True
+    text = " ".join(
+        str(value or "")
+        for value in (
+            data.get("final_response_preview"),
+            data.get("response"),
+            data.get("error"),
+            data.get("exception"),
+            metadata.get("final_response_preview"),
+            metadata.get("error"),
+        )
+    ).lower()
+    return any(term in text for term in _ANALYSIS_TRIGGER_SUPPRESSED_TERMS)
+
+
+def _lower_first_str(
+    primary: Mapping[str, Any],
+    secondary: Mapping[str, Any],
+    key: str,
+) -> str:
+    value = primary.get(key)
+    if value is None:
+        value = secondary.get(key)
+    return str(value or "").strip().lower()
 
 
 def _none_or_str(value: Any) -> str | None:

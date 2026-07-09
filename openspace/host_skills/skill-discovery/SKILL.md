@@ -48,13 +48,15 @@ Use this single cloud tool when local search is not enough. Continue calling
 the same tool with the returned `next_actions[].action`.
 
 ```
-cloud_browse_skills(action="recall", query="automated deployment with rollback")
-cloud_browse_skills(action="pull_projection", search_id="<search_id>", package_ids=["<package_id>"])
-cloud_browse_skills(action="search_package_skills", package_id="<package_id>", query="automated deployment with rollback")
+cloud_browse_skills(action="search_skills", query="automated deployment with rollback")
 cloud_browse_skills(action="local_placement", query="automated deployment with rollback")
 cloud_browse_skills(action="local_placement", local_category_path="technology/computing/deployment")
 cloud_browse_skills(action="import_skill", cloud_skill_id="<cloud_skill_id>", local_category_path="technology/computing/deployment/rollback")
 ```
+
+Use `recall` and `pull_projection` only when you need package discovery or
+package outlines before choosing a skill. Concrete skill search should start
+with `search_skills`.
 
 Choose `local_category_path` for the user's local package taxonomy. It uses the
 same shape as cloud package paths, but is stored independently and may be more

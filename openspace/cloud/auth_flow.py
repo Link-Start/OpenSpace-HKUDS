@@ -185,12 +185,14 @@ def _bootstrap_agent_key(
         password=password_value,
         name=name,
     )
-    login = _login_user(client, email=email_value, password=password_value)
-    token = str(login["access_token"])
     try:
-        created_agent = client.create_agent(access_token=token, name=agent_name_value)
+        bootstrapped_agent = client.agent_bootstrap(
+            email=email_value,
+            password=password_value,
+            agent_name=agent_name_value,
+        )
         saved = _persist_key_if_requested(
-            created_agent.get("api_key"),
+            bootstrapped_agent.get("api_key"),
             config=config,
             persist=persist,
             credentials_path=credentials_path,
@@ -199,15 +201,15 @@ def _bootstrap_agent_key(
             client,
             runtime_factory,
             config,
-            api_key=created_agent.get("api_key"),
+            api_key=bootstrapped_agent.get("api_key"),
             credentials_path=credentials_path,
         )
         return {
             "status": "success",
             "action": "bootstrap_agent_key",
             "registered": _public_user_payload(registered),
-            "owner": _public_login_result(login, email=email_value),
-            "agent": redact_cloud_payload({k: v for k, v in created_agent.items() if k != "api_key"}),
+            "owner": redact_cloud_payload(bootstrapped_agent.get("owner", {})),
+            "agent": redact_cloud_payload(bootstrapped_agent.get("agent", {})),
             **saved,
             "verification": verification,
             "recovered_existing_agent": False,

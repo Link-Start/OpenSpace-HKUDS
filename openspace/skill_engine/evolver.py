@@ -75,6 +75,8 @@ class _EvolutionFinalOutput:
     change_summary: Optional[str] = None
     overlay_fields: Dict[str, Any] = field(default_factory=dict)
     overlay_metadata: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    intent_spec: Dict[str, Any] = field(default_factory=dict)
+    eval_plan: Dict[str, Any] = field(default_factory=dict)
 
 
 def _sanitize_skill_name(name: str) -> str:
@@ -194,12 +196,20 @@ def _extract_evolution_finalization(
         overlay_metadata.update(final_metadata)
 
     change_summary = str(payload.get("change_summary", "")).strip() or None
+    intent_spec = payload.get("intent_spec")
+    eval_plan = payload.get("eval_plan")
+    if not isinstance(intent_spec, dict) or not intent_spec:
+        return None, "Evolution finalization missing intent_spec", True
+    if not isinstance(eval_plan, dict) or not eval_plan:
+        return None, "Evolution finalization missing eval_plan", True
     return (
         _EvolutionFinalOutput(
             edit_content=edit_content,
             change_summary=change_summary,
             overlay_fields=overlay_fields,
             overlay_metadata=overlay_metadata,
+            intent_spec=dict(intent_spec),
+            eval_plan=dict(eval_plan),
         ),
         None,
         True,

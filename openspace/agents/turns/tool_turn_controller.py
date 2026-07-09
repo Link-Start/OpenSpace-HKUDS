@@ -6,8 +6,13 @@ import copy
 from dataclasses import dataclass
 from typing import Any
 
-from openspace.agents.turns import session_policy, stop_policy
+from openspace.agents.turns import (
+    bench_checker_guard,
+    session_policy,
+    stop_policy,
+)
 from openspace.agents.turns.context import TurnControllerContext
+from openspace.agents.turns.task_query import resolve_task_query
 from openspace.services.conversation.attachments import (
     create_attachment_message,
     get_turn_attachment_messages_async,
@@ -75,7 +80,10 @@ async def refresh_tools_for_iteration(
         )
 
     try:
-        refreshed_preselected = await agent._get_available_tools(turn.instruction)
+        tool_retrieval_instruction = resolve_task_query(context, turn.instruction)
+        refreshed_preselected = await agent._get_available_tools(
+            tool_retrieval_instruction
+        )
         refreshed = await agent._get_tool_universe(refreshed_preselected)
         refreshed = agent._with_memory_mode_tools(
             refreshed,
@@ -121,12 +129,20 @@ async def refresh_tools_for_iteration(
                 if getattr(tool, "is_deferred", False)
             )
             tool_use_context.all_tools = list(tools)
-            tool_use_context.deferred_tool_names = set(
-                agent._deferred_tool_names(
-                    tools,
-                    discovered_tool_names=tool_use_context.discovered_tool_names,
+            configured_deferred_tool_names = context.get("policy_deferred_tool_names")
+            if configured_deferred_tool_names is not None:
+                tool_use_context.deferred_tool_names = {
+                    str(name)
+                    for name in configured_deferred_tool_names
+                    if str(name) and str(name) not in tool_use_context.discovered_tool_names
+                }
+            else:
+                tool_use_context.deferred_tool_names = set(
+                    agent._deferred_tool_names(
+                        tools,
+                        discovered_tool_names=tool_use_context.discovered_tool_names,
+                    )
                 )
-            )
             active_tools = agent._build_active_tools(
                 tools,
                 discovered_tool_names=tool_use_context.discovered_tool_names,
@@ -177,12 +193,13 @@ async def prepare_tools_for_model_call(
     context = turn.context
     tool_use_context = turn.tool_use_context
     state = turn.state
-    policy_deferred_names = set(context.get("policy_deferred_tool_names") or ())
-    if policy_deferred_names:
+    configured_deferred_tool_names = context.get("policy_deferred_tool_names")
+    if configured_deferred_tool_names is not None:
+        policy_deferred_names = {str(name) for name in configured_deferred_tool_names}
         tool_use_context.deferred_tool_names = {
             name
             for name in policy_deferred_names
-            if name not in tool_use_context.discovered_tool_names
+            if name and name not in tool_use_context.discovered_tool_names
         }
     else:
         tool_use_context.deferred_tool_names = set(
@@ -251,6 +268,7 @@ async def execute_tool_turn(
     agent = turn.agent
     context = turn.context
     instruction = turn.instruction
+    task_query = resolve_task_query(context, instruction)
     tool_use_context = turn.tool_use_context
     state = turn.state
     tools_result: RunToolsResult = await run_tools(
@@ -268,13 +286,35 @@ async def execute_tool_turn(
             tools=tools,
         )
     )
+    if model_response.tool_calls and state.max_output_tokens_recovery_count:
+        logger.info(
+            "Resetting max-output recovery count after tool execution "
+            "(previous=%s)",
+            state.max_output_tokens_recovery_count,
+        )
+        state.reset_max_output_recovery()
+    bench_checker_guard.update_from_tool_turn(
+        state,
+        tool_calls=model_response.tool_calls,
+        result_messages=tools_result.messages,
+    )
 
     messages.extend(tools_result.messages)
     agent._sync_tool_use_context_runtime(tool_use_context, messages=messages)
 
+    aggregate_tool_result_limit = context.get("max_tool_results_per_message_chars")
+    try:
+        aggregate_tool_result_limit = int(aggregate_tool_result_limit)
+    except (TypeError, ValueError):
+        aggregate_tool_result_limit = None
+    budget_kwargs: dict[str, Any] = {}
+    if aggregate_tool_result_limit and aggregate_tool_result_limit > 0:
+        budget_kwargs["max_chars"] = aggregate_tool_result_limit
+
     messages = enforce_tool_result_budget(
         messages,
         results_dir=getattr(tool_use_context, "tool_results_dir", None),
+        **budget_kwargs,
     )
     agent._sync_tool_use_context_runtime(tool_use_context, messages=messages)
     await session_policy.save_after_tool_result_budget(
@@ -392,7 +432,7 @@ async def execute_tool_turn(
         )
 
     discovery_query = await agent._build_post_tool_skill_discovery_query(
-        instruction,
+        task_query,
         messages,
         abort_event=turn.abort_event,
     )

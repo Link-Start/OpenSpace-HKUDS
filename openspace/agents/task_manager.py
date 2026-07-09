@@ -51,6 +51,51 @@ TASK_ID_PREFIXES: dict[str, str] = {
 
 TASK_ID_ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyz"
 DEFAULT_TASK_OUTPUT_DIR = Path(tempfile.gettempdir()) / "openspace-agent-tasks"
+_REGISTERED_INTERNAL_OUTPUT_DIRS: set[str] = set()
+
+
+def _register_internal_output_dir(output_dir: Path) -> None:
+    """Allow read access to TaskManager-owned output files.
+
+    Background shell/agent output lives outside the workspace in normal
+    sessions. The directory may be under ``~/.openspace``, which is otherwise
+    treated as sensitive. This narrow internal carve-out keeps the model able
+    to inspect outputs it just created without opening broader config access.
+    """
+    try:
+        root = output_dir.expanduser().resolve()
+    except OSError:
+        root = output_dir.expanduser().absolute()
+    key = str(root)
+    if key in _REGISTERED_INTERNAL_OUTPUT_DIRS:
+        return
+    _REGISTERED_INTERNAL_OUTPUT_DIRS.add(key)
+
+    try:
+        from openspace.grounding.core.permissions import register_internal_path_predicate
+    except Exception:
+        logger.debug("Could not register internal task output dir", exc_info=True)
+        return
+
+    def _is_task_output_path(path: str, *, _root: Path = root) -> bool:
+        try:
+            candidate = Path(path).expanduser().resolve()
+        except OSError:
+            candidate = Path(path).expanduser().absolute()
+        try:
+            return candidate.is_relative_to(_root) and candidate.is_file()
+        except AttributeError:  # pragma: no cover - Python < 3.9 fallback
+            try:
+                candidate.relative_to(_root)
+                return candidate.is_file()
+            except ValueError:
+                return False
+
+    register_internal_path_predicate(
+        category="readable",
+        reason="TaskManager-owned background task output is readable",
+        predicate=_is_task_output_path,
+    )
 
 
 def is_terminal_task_status(status: TaskStatus | str) -> bool:
@@ -204,6 +249,7 @@ class TaskManager:
         self._event_sink = event_sink
         self._output_dir = Path(output_dir) if output_dir is not None else DEFAULT_TASK_OUTPUT_DIR
         self._output_dir.mkdir(parents=True, exist_ok=True)
+        _register_internal_output_dir(self._output_dir)
         self._active_team_name: str | None = None
         self._team_metadata: dict[str, Any] | None = None
 

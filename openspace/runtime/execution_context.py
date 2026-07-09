@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 from typing import Any
 
@@ -128,6 +129,37 @@ class ExecutionContextManager:
             "hard_active_tool_limit",
             config.hard_active_tool_limit,
         )
+        if config.max_result_size_chars is not None:
+            execution_context.setdefault(
+                "max_result_size_chars",
+                int(config.max_result_size_chars),
+            )
+        if config.max_tool_results_per_message_chars is not None:
+            execution_context.setdefault(
+                "max_tool_results_per_message_chars",
+                int(config.max_tool_results_per_message_chars),
+            )
+        if config.active_tool_names is not None:
+            execution_context.setdefault(
+                "active_tool_names",
+                list(config.active_tool_names),
+            )
+        if config.policy_deferred_tool_names is not None:
+            execution_context.setdefault(
+                "policy_deferred_tool_names",
+                list(config.policy_deferred_tool_names),
+            )
+        if config.tool_retrieval_query is not None:
+            execution_context.setdefault(
+                "tool_retrieval_query",
+                config.tool_retrieval_query,
+            )
+        execution_context.setdefault(
+            "skills_disabled",
+            bool(config.skills_disabled),
+        )
+        if config.memory_mode is not None:
+            execution_context.setdefault("memory_mode", config.memory_mode)
         execution_context.setdefault(
             "tool_schema_cache_telemetry",
             config.tool_schema_cache_telemetry,
@@ -142,6 +174,10 @@ class ExecutionContextManager:
         execution_context: dict[str, Any],
     ) -> None:
         if "permission_mode" in execution_context:
+            return
+        env_mode = os.environ.get("OPENSPACE_PERMISSION_MODE", "").strip()
+        if env_mode:
+            execution_context["permission_mode"] = env_mode
             return
         cwd = execution_context.get("workspace_dir") or getattr(
             self.config,

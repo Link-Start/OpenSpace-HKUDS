@@ -26,7 +26,7 @@ export type HandlerRegistration = {
 
 export type InputHandlerRegistration = {
   context: KeybindingContextName;
-  handler: (input: string, key: Key) => void;
+  handler: (input: string, key: Key) => void | false;
 };
 
 type KeybindingContextValue = {
@@ -164,8 +164,9 @@ export function KeybindingProvider({
             continue;
           }
 
-          registration.handler(input, key);
-          return true;
+          if (registration.handler(input, key) !== false) {
+            return true;
+          }
         }
       }
 

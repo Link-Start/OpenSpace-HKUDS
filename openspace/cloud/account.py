@@ -18,7 +18,7 @@ from openspace.cloud.transport import (
 
 
 class OpenSpaceAccountClient:
-    """Synchronous client for v1 auth and agent-key management endpoints."""
+    """Synchronous client for cloud auth and agent-key management endpoints."""
 
     _DEFAULT_UA = "OpenSpace-Client/1.0"
 
@@ -35,6 +35,7 @@ class OpenSpaceAccountClient:
         method: str,
         path: str,
         *,
+        version: str = "v1",
         payload: Dict[str, Any] | None = None,
         headers: Dict[str, str] | None = None,
         timeout: int = 30,
@@ -51,7 +52,7 @@ class OpenSpaceAccountClient:
         response = self._transport.send(
             CloudRequest(
                 method=method,
-                url=cloud_api_url(self._config.base_url, "v1", path),
+                url=cloud_api_url(self._config.base_url, version, path),
                 headers=request_headers,
                 body=body,
                 timeout=timeout,
@@ -86,17 +87,16 @@ class OpenSpaceAccountClient:
         password: str,
         name: str | None = None,
     ) -> Dict[str, Any]:
-        """POST /api/v1/auth/users/register."""
+        """POST /api/v2/auth/users/register."""
         payload: Dict[str, Any] = {"email": email, "password": password}
-        if name:
-            payload["name"] = name
-        return self._request_json("POST", "/auth/users/register", payload=payload)
+        return self._request_json("POST", "/auth/users/register", version="v2", payload=payload)
 
     def login_user(self, *, email: str, password: str) -> Dict[str, Any]:
-        """POST /api/v1/auth/users/login."""
+        """POST /api/v2/auth/users/login."""
         return self._request_json(
             "POST",
             "/auth/users/login",
+            version="v2",
             payload={"email": email, "password": password},
         )
 
@@ -107,7 +107,7 @@ class OpenSpaceAccountClient:
         password: str,
         agent_name: str,
     ) -> Dict[str, Any]:
-        """POST /api/v1/auth/agent-bootstrap.
+        """POST /api/v2/auth/agent-bootstrap.
 
         This endpoint intentionally sends no Authorization, X-API-Key, or
         X-Admin-Key headers. The returned ``api_key`` is shown once by server
@@ -116,6 +116,7 @@ class OpenSpaceAccountClient:
         return self._request_json(
             "POST",
             "/auth/agent-bootstrap",
+            version="v2",
             payload={
                 "email": email,
                 "password": password,

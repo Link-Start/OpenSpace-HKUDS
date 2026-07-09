@@ -10,6 +10,8 @@ exclusions and results are re-filtered against canonical paths.
 from __future__ import annotations
 
 import asyncio
+import bisect
+import fnmatch
 import os
 import re
 import shutil
@@ -389,6 +391,266 @@ def _append_permission_ignore_globs(
         args.extend(["--glob", f"!{pattern}"])
 
 
+def _python_glob_files(
+    search_dir: str,
+    pattern: str,
+    permission_context: ToolUseContext | Any | None,
+    tool_name: str,
+) -> list[str]:
+    """Fallback for GlobTool when ripgrep is unavailable in minimal containers."""
+    matches: list[str] = []
+    normalized_pattern = pattern.replace("\\", "/")
+    permission_ignores = _get_permission_ignore_patterns(
+        search_dir,
+        permission_context,
+    )
+
+    for root, dirnames, filenames in os.walk(search_dir):
+        rel_root = os.path.relpath(root, search_dir)
+        rel_root_posix = "" if rel_root == "." else rel_root.replace(os.sep, "/")
+        kept_dirs: list[str] = []
+        for dirname in dirnames:
+            rel_dir = f"{rel_root_posix}/{dirname}" if rel_root_posix else dirname
+            if any(fnmatch.fnmatch(rel_dir, ignore) for ignore in permission_ignores):
+                continue
+            kept_dirs.append(dirname)
+        dirnames[:] = kept_dirs
+
+        for filename in filenames:
+            rel_path = f"{rel_root_posix}/{filename}" if rel_root_posix else filename
+            if any(fnmatch.fnmatch(rel_path, ignore) for ignore in permission_ignores):
+                continue
+            if not (
+                fnmatch.fnmatch(rel_path, normalized_pattern)
+                or fnmatch.fnmatch(filename, normalized_pattern)
+            ):
+                continue
+            absolute_path = os.path.normpath(os.path.join(search_dir, rel_path))
+            if _has_read_permission(
+                absolute_path,
+                tool_name,
+                permission_context,
+            ):
+                matches.append(absolute_path)
+
+    matches.sort(key=lambda item: (os.path.getmtime(item), item))
+    return matches
+
+
+_FALLBACK_TYPE_GLOBS = {
+    "c": ("*.c", "*.h"),
+    "cpp": ("*.cc", "*.cpp", "*.cxx", "*.hpp", "*.hh", "*.hxx"),
+    "go": ("*.go",),
+    "java": ("*.java",),
+    "js": ("*.js", "*.jsx", "*.mjs", "*.cjs"),
+    "json": ("*.json",),
+    "javascript": ("*.js", "*.jsx", "*.mjs", "*.cjs"),
+    "md": ("*.md", "*.markdown"),
+    "py": ("*.py", "*.pyi"),
+    "python": ("*.py", "*.pyi"),
+    "rb": ("*.rb",),
+    "rs": ("*.rs",),
+    "rust": ("*.rs",),
+    "sh": ("*.sh", "*.bash", "*.zsh"),
+    "toml": ("*.toml",),
+    "ts": ("*.ts", "*.tsx"),
+    "tsx": ("*.tsx",),
+    "typescript": ("*.ts", "*.tsx"),
+    "txt": ("*.txt",),
+    "yaml": ("*.yaml", "*.yml"),
+}
+
+
+def _coerce_nonnegative_int(value: Any, default: int = 0) -> int:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _expand_simple_brace_glob(pattern: str) -> list[str]:
+    """Expand simple ripgrep-style brace globs such as ``*.{ts,tsx}``."""
+    start = pattern.find("{")
+    end = pattern.find("}", start + 1)
+    if start < 0 or end < 0:
+        return [pattern]
+    choices = [item.strip() for item in pattern[start + 1:end].split(",")]
+    if not choices:
+        return [pattern]
+    prefix = pattern[:start]
+    suffix = pattern[end + 1:]
+    return [f"{prefix}{choice}{suffix}" for choice in choices if choice]
+
+
+def _expand_fallback_globs(
+    glob_patterns: list[str],
+    type_filter: str | None,
+) -> list[str]:
+    patterns: list[str] = []
+    for pattern in glob_patterns:
+        if pattern:
+            patterns.extend(_expand_simple_brace_glob(pattern))
+    if type_filter:
+        patterns.extend(_FALLBACK_TYPE_GLOBS.get(type_filter.lower(), ()))
+    return patterns
+
+
+def _matches_path_glob(rel_path: str, basename: str, pattern: str) -> bool:
+    normalized = pattern.replace("\\", "/")
+    return (
+        fnmatch.fnmatch(rel_path, normalized)
+        or fnmatch.fnmatch(basename, normalized)
+    )
+
+
+def _matches_any_path_glob(rel_path: str, patterns: list[str]) -> bool:
+    basename = os.path.basename(rel_path)
+    return any(_matches_path_glob(rel_path, basename, pattern) for pattern in patterns)
+
+
+def _line_start_offsets(text: str) -> list[int]:
+    offsets = [0]
+    for match in re.finditer("\n", text):
+        offsets.append(match.end())
+    return offsets
+
+
+def _line_for_offset(offsets: list[int], offset: int) -> int:
+    return max(1, bisect.bisect_right(offsets, offset))
+
+
+def _context_line_numbers(
+    match_lines: list[int],
+    total_lines: int,
+    before: int,
+    after: int,
+) -> list[int]:
+    selected: set[int] = set()
+    for line_no in match_lines:
+        start = max(1, line_no - before)
+        end = min(total_lines, line_no + after)
+        selected.update(range(start, end + 1))
+    return sorted(selected)
+
+
+def _python_grep_files(
+    *,
+    execution_root: str,
+    target: str,
+    pattern: str,
+    output_mode: str,
+    glob_patterns: list[str],
+    type_filter: str | None,
+    case_insensitive: bool,
+    show_line_numbers: bool,
+    context_before: int,
+    context_after: int,
+    multiline: bool,
+    permission_context: ToolUseContext | Any | None,
+    tool_name: str,
+) -> list[str]:
+    """Small grep fallback for minimal containers without ripgrep.
+
+    The fallback intentionally implements the common grep surface rather than
+    every ripgrep flag: regex search, glob/type filters, files/count/content
+    modes, line numbers, and nearby context. Ripgrep remains the fast path.
+    """
+    flags = re.IGNORECASE | (re.DOTALL if multiline else 0)
+    regex = re.compile(pattern, flags)
+    target_path = os.path.normpath(os.path.join(execution_root, target))
+    effective_globs = _expand_fallback_globs(glob_patterns, type_filter)
+    permission_ignores = _get_permission_ignore_patterns(
+        execution_root,
+        permission_context,
+    )
+    files: list[str] = []
+
+    def include_file(path: str) -> bool:
+        rel_path = _to_relative_path(path, execution_root).replace(os.sep, "/")
+        if permission_ignores and _matches_any_path_glob(rel_path, permission_ignores):
+            return False
+        if effective_globs and not _matches_any_path_glob(rel_path, effective_globs):
+            return False
+        if any(part in VCS_DIRECTORIES_TO_EXCLUDE for part in rel_path.split("/")):
+            return False
+        return _has_read_permission(path, tool_name, permission_context)
+
+    if os.path.isfile(target_path):
+        if include_file(target_path):
+            files.append(target_path)
+    else:
+        walk_root = target_path if os.path.isdir(target_path) else execution_root
+        for root, dirnames, filenames in os.walk(walk_root):
+            rel_root = _to_relative_path(root, execution_root).replace(os.sep, "/")
+            kept_dirs: list[str] = []
+            for dirname in dirnames:
+                if dirname in VCS_DIRECTORIES_TO_EXCLUDE:
+                    continue
+                rel_dir = dirname if rel_root == "." else f"{rel_root}/{dirname}"
+                if permission_ignores and _matches_any_path_glob(rel_dir, permission_ignores):
+                    continue
+                kept_dirs.append(dirname)
+            dirnames[:] = kept_dirs
+            for filename in filenames:
+                candidate = os.path.join(root, filename)
+                if include_file(candidate):
+                    files.append(candidate)
+
+    results: list[str] = []
+    for file_path in sorted(files):
+        rel_path = _to_relative_path(file_path, execution_root)
+        try:
+            with open(file_path, "r", encoding="utf-8", errors="replace") as handle:
+                text = handle.read()
+        except OSError:
+            continue
+
+        lines = text.splitlines()
+        if multiline:
+            offsets = _line_start_offsets(text)
+            matched_line_numbers = sorted(
+                {
+                    _line_for_offset(offsets, match.start())
+                    for match in regex.finditer(text)
+                }
+            )
+        else:
+            matched_line_numbers = [
+                line_no
+                for line_no, line in enumerate(lines, start=1)
+                if regex.search(line)
+            ]
+
+        if not matched_line_numbers:
+            continue
+        if output_mode == "files_with_matches":
+            results.append(rel_path)
+        elif output_mode == "count":
+            results.append(f"{rel_path}:{len(matched_line_numbers)}")
+        else:
+            context_line_numbers = _context_line_numbers(
+                matched_line_numbers,
+                len(lines),
+                context_before,
+                context_after,
+            )
+            previous_line_no: int | None = None
+            match_line_set = set(matched_line_numbers)
+            for line_no in context_line_numbers:
+                if previous_line_no is not None and line_no > previous_line_no + 1:
+                    results.append("--")
+                previous_line_no = line_no
+                if line_no < 1 or line_no > len(lines):
+                    continue
+                line = lines[line_no - 1].rstrip("\n\r")[:MAX_COLUMNS]
+                separator = ":" if line_no in match_line_set else "-"
+                if show_line_numbers:
+                    results.append(f"{rel_path}{separator}{line_no}{separator}{line}")
+                else:
+                    results.append(f"{rel_path}:{line}")
+    return results
+
+
 def _add_permission_path_candidate(candidates: list[str], path: str) -> None:
     """Add path plus macOS /private aliases used by permission checks."""
     if not path or path in candidates:
@@ -758,6 +1020,16 @@ class GrepTool(BaseTool):
         context_c: int | None = kwargs.get("-C") or kwargs.get("context_c")
         show_line_numbers: bool = kwargs.get("-n", kwargs.get("show_line_numbers", True))
         case_insensitive: bool = kwargs.get("-i", kwargs.get("case_insensitive", False))
+        fallback_context_before = 0
+        fallback_context_after = 0
+        if output_mode == "content":
+            if context is not None:
+                fallback_context_before = fallback_context_after = _coerce_nonnegative_int(context)
+            elif context_c is not None:
+                fallback_context_before = fallback_context_after = _coerce_nonnegative_int(context_c)
+            else:
+                fallback_context_before = _coerce_nonnegative_int(context_before)
+                fallback_context_after = _coerce_nonnegative_int(context_after)
 
         cwd = _get_cwd(self._session, self._current_context)
         absolute_path = _expand_path(path, cwd) if path else cwd
@@ -819,8 +1091,8 @@ class GrepTool(BaseTool):
             args.extend(["--type", type])
 
         # Glob filters: split on whitespace, then commas unless braces are used.
+        glob_patterns: list[str] = []
         if glob:
-            glob_patterns: list[str] = []
             raw_patterns = glob.split()
             for raw in raw_patterns:
                 if "{" in raw and "}" in raw:
@@ -838,12 +1110,35 @@ class GrepTool(BaseTool):
         try:
             results = await _run_ripgrep(args, target, cwd=execution_root)
         except FileNotFoundError:
-            return ToolResult(
-                status=ToolStatus.ERROR,
-                error=(
-                    "ripgrep (rg) is not installed or not found on PATH. "
-                    "Install it: https://github.com/BurntSushi/ripgrep#installation"
-                ),
+            try:
+                results = _python_grep_files(
+                    execution_root=execution_root,
+                    target=target,
+                    pattern=pattern,
+                    output_mode=output_mode,
+                    glob_patterns=glob_patterns,
+                    type_filter=type,
+                    case_insensitive=case_insensitive,
+                    show_line_numbers=show_line_numbers,
+                    context_before=fallback_context_before,
+                    context_after=fallback_context_after,
+                    multiline=multiline,
+                    permission_context=permission_context,
+                    tool_name=self._name,
+                )
+            except re.error as e:
+                return ToolResult(
+                    status=ToolStatus.ERROR,
+                    error=f"Invalid regular expression: {e}",
+                )
+            except OSError as e:
+                return ToolResult(
+                    status=ToolStatus.ERROR,
+                    error=f"Python grep fallback failed: {e}",
+                )
+            logger.info(
+                "ripgrep not found; used Python grep fallback for %s",
+                pattern,
             )
         except TimeoutError as e:
             return ToolResult(
@@ -1195,16 +1490,17 @@ class GlobTool(BaseTool):
         _append_permission_ignore_globs(args, search_dir, permission_context)
         # This runtime has no plugin-cache path exclusions to add.
 
+        search_backend = "ripgrep"
         try:
             all_paths = await _run_ripgrep(args, ".", cwd=search_dir)
         except FileNotFoundError:
-            return ToolResult(
-                status=ToolStatus.ERROR,
-                error=(
-                    "ripgrep (rg) is not installed or not found on PATH. "
-                    "Install it: https://github.com/BurntSushi/ripgrep#installation"
-                ),
+            absolute_paths = _python_glob_files(
+                search_dir,
+                search_pattern,
+                permission_context,
+                self._name,
             )
+            search_backend = "python_fallback"
         except TimeoutError as e:
             return ToolResult(
                 status=ToolStatus.ERROR,
@@ -1215,19 +1511,19 @@ class GlobTool(BaseTool):
                 status=ToolStatus.ERROR,
                 error=str(e),
             )
+        else:
+            all_paths = _filter_file_results_by_permissions(
+                all_paths,
+                execution_root=search_dir,
+                permission_context=permission_context,
+                tool_name=self._name,
+            )
 
-        all_paths = _filter_file_results_by_permissions(
-            all_paths,
-            execution_root=search_dir,
-            permission_context=permission_context,
-            tool_name=self._name,
-        )
-
-        # Convert relative paths from rg to absolute
-        absolute_paths = [
-            _resolve_search_result_path(p, search_dir)
-            for p in all_paths
-        ]
+            # Convert relative paths from rg to absolute
+            absolute_paths = [
+                _resolve_search_result_path(p, search_dir)
+                for p in all_paths
+            ]
 
         truncated = len(absolute_paths) > limit
         files = absolute_paths[:limit]
@@ -1257,6 +1553,7 @@ class GlobTool(BaseTool):
                 "num_files": len(filenames),
                 "filenames": filenames,
                 "truncated": truncated,
+                "search_backend": search_backend,
             },
         )
 

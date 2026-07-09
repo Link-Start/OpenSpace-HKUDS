@@ -35,22 +35,6 @@ class ExecutionFinalizer:
         if recording_manager and recording_manager.recording_status:
             recording_dir = recording_manager.trajectory_dir
 
-            try:
-                exec_time = asyncio.get_event_loop().time() - start_time
-                await recording_manager.save_execution_outcome(
-                    status=result.get("status", "unknown"),
-                    iterations=result.get("iterations", 0),
-                    execution_time=exec_time,
-                )
-            except Exception:
-                pass
-
-            try:
-                await recording_manager.stop()
-                logger.debug(f"Recording stopped: {task_id}")
-            except Exception as exc:
-                logger.warning(f"Failed to stop recording: {exc}")
-
         final_result = {
             **result,
             "task_id": task_id,
@@ -66,70 +50,121 @@ class ExecutionFinalizer:
             if capability_state is not None:
                 final_result["session_capability_state"] = capability_state
 
-        await self._emit_task_finish_evidence(
-            "task_finished_pre_persist",
-            task_id=task_id,
-            recording_dir=recording_dir,
-            final_result=final_result,
-            execution_context=execution_context,
-            capture_skill_dir=capture_skill_dir,
-        )
-        await self.drain_memory_background_tasks(
-            timeout_s=memory_drain_timeout,
-            reason="pre_persist",
-            context=execution_context,
-        )
-        await self.session_runtime.persist(final_result, execution_context)
-        await self._scan_session_evidence_checkpoint(
-            task_id=task_id,
-            execution_context=execution_context,
-        )
-        await self._scan_skill_evidence_checkpoint(
-            task_id=task_id,
-            execution_context=execution_context,
-        )
-        await self._scan_tool_quality_evidence_checkpoint()
-        await self._emit_task_finish_evidence(
-            "task_session_persisted",
-            task_id=task_id,
-            recording_dir=recording_dir,
-            final_result=final_result,
-            execution_context=execution_context,
-            capture_skill_dir=capture_skill_dir,
-        )
-        await self._scan_quality_signal_checkpoint(
-            task_id=task_id,
-            execution_context=execution_context,
-        )
-
-        post_execution_mode = self.post_execution_mode()
-        if cancelled_exc is None and post_execution_mode == "inline":
-            await self.run_post_execution_tasks(
-                task_id,
-                recording_dir,
-                result,
-                evolved_skills=evolved_skills,
-                capture_skill_dir=capture_skill_dir,
-            )
-            final_result["evolved_skills"] = list(evolved_skills)
-
-        if cancelled_exc is None and post_execution_mode == "background":
-            self.schedule_post_execution_tasks(
-                task_id,
-                recording_dir,
-                result,
-                evolved_skills=evolved_skills,
-                capture_skill_dir=capture_skill_dir,
-            )
-
-        if cancelled_exc is None:
-            await self._maybe_report_cloud_task_trace(
+        try:
+            await self._emit_task_finish_evidence(
+                "task_finished_pre_persist",
                 task_id=task_id,
+                recording_dir=recording_dir,
                 final_result=final_result,
+                execution_context=execution_context,
+                capture_skill_dir=capture_skill_dir,
+            )
+            await self.drain_memory_background_tasks(
+                timeout_s=memory_drain_timeout,
+                reason="pre_persist",
+                context=execution_context,
+            )
+            await self.session_runtime.persist(final_result, execution_context)
+            await self._scan_session_evidence_checkpoint(
+                task_id=task_id,
+                execution_context=execution_context,
+            )
+            await self._scan_skill_evidence_checkpoint(
+                task_id=task_id,
+                execution_context=execution_context,
+            )
+            await self._scan_tool_quality_evidence_checkpoint()
+            await self._emit_task_finish_evidence(
+                "task_session_persisted",
+                task_id=task_id,
+                recording_dir=recording_dir,
+                final_result=final_result,
+                execution_context=execution_context,
+                capture_skill_dir=capture_skill_dir,
+            )
+            await self._scan_quality_signal_checkpoint(
+                task_id=task_id,
                 execution_context=execution_context,
             )
 
-        return final_result
+            post_execution_mode = self.post_execution_mode()
+            if cancelled_exc is None and post_execution_mode == "inline":
+                post_execution = self.run_post_execution_tasks(
+                    task_id,
+                    recording_dir,
+                    result,
+                    evolved_skills=evolved_skills,
+                    capture_skill_dir=capture_skill_dir,
+                )
+                post_execution_timeout_s = self.post_execution_timeout_s()
+                try:
+                    if post_execution_timeout_s > 0:
+                        await asyncio.wait_for(
+                            post_execution,
+                            timeout=post_execution_timeout_s,
+                        )
+                    else:
+                        await post_execution
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "Inline post-execution tasks timed out after %.2fs; "
+                        "returning task result without waiting for more evolution",
+                        post_execution_timeout_s,
+                    )
+                    final_result["post_execution_timed_out"] = True
+                else:
+                    final_result["evolved_skills"] = list(evolved_skills)
+
+            if cancelled_exc is None and post_execution_mode == "background":
+                self.schedule_post_execution_tasks(
+                    task_id,
+                    recording_dir,
+                    result,
+                    evolved_skills=evolved_skills,
+                    capture_skill_dir=capture_skill_dir,
+                )
+
+            if cancelled_exc is None:
+                await self._maybe_report_cloud_task_trace(
+                    task_id=task_id,
+                    final_result=final_result,
+                    execution_context=execution_context,
+                )
+
+            return final_result
+        finally:
+            await self._stop_recording(
+                recording_manager=recording_manager,
+                task_id=task_id,
+                start_time=start_time,
+                result=result,
+            )
+
+    async def _stop_recording(
+        self,
+        *,
+        recording_manager: Any,
+        task_id: str,
+        start_time: float,
+        result: dict[str, Any],
+    ) -> None:
+        if not recording_manager or not recording_manager.recording_status:
+            return
+        try:
+            exec_time = asyncio.get_event_loop().time() - start_time
+            await recording_manager.save_execution_outcome(
+                status=result.get("status", "unknown"),
+                iterations=result.get("iterations", 0),
+                execution_time=exec_time,
+            )
+        except Exception:
+            pass
+
+        try:
+            await recording_manager.stop()
+            logger.debug(f"Recording stopped: {task_id}")
+        except Exception as exc:
+            logger.warning(f"Failed to stop recording: {exc}")
 
     async def _maybe_report_cloud_task_trace(
         self,

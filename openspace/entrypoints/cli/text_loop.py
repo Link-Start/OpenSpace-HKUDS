@@ -19,12 +19,14 @@ def _summary_payload(result: ExecutionResult) -> dict:
     return {
         "status": result.status,
         "response": result.text,
+        "user_response": result.text,
         "error": result.error,
         "task_id": result.task_id,
         "session_id": result.session_id,
         "execution_time": result.execution_time,
         "iterations": result.iterations,
         "tool_executions": list(result.tool_executions),
+        "completed_tasks": len(result.tool_executions),
         "skills_used": list(result.skills_used),
         "evolved_skills": list(result.evolved_skills),
         "active_skills": list(result.active_skills),
@@ -81,7 +83,12 @@ class UIManager:
 
 async def _execute_task(openspace: OpenSpace, query: str, ui_manager: UIManager):
     await ui_manager.start_live_display()
-    result = await openspace.execute(ExecutionRequest(prompt=query))
+    result = await openspace.execute(
+        ExecutionRequest(
+            prompt=query,
+            capture_skill_dir=getattr(openspace.config, "capture_skill_dir", None),
+        )
+    )
     await ui_manager.stop_live_display()
     ui_manager.print_summary(_summary_payload(result))
     return result

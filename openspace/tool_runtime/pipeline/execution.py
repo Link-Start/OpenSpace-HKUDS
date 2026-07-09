@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -74,6 +75,25 @@ EXIT_PLAN_MODE_TOOL_NAME = "ExitPlanMode"
 
 # ToolSearch integration — populated in step 11.1
 TOOL_SEARCH_TOOL_NAME = "tool_search"
+
+LIST_DIR_TOOL_NAME = "ls"
+
+PATH_ARGUMENT_TARGETS = {
+    FILE_READ_TOOL_NAME: "file_path",
+    FILE_EDIT_TOOL_NAME: "file_path",
+    FILE_WRITE_TOOL_NAME: "file_path",
+    GREP_TOOL_NAME: "path",
+    GLOB_TOOL_NAME: "path",
+    LIST_DIR_TOOL_NAME: "path",
+}
+
+PATH_ARGUMENT_ALIASES = {
+    "file",
+    "file_path",
+    "filepath",
+    "filename",
+    "path",
+}
 
 # Invisible Unicode characters that LLMs sometimes inject into code strings.
 # Implementation: normalizeFileEditInput in tools/FileEditTool/utils.ts
@@ -779,6 +799,7 @@ def normalize_tool_input(
     - Default: return input unchanged
     """
     tool_name = tool.name
+    input = _normalize_path_argument_aliases(tool_name, input)
 
     if tool_name == EXIT_PLAN_MODE_TOOL_NAME:
         return _normalize_exit_plan_mode_input(input, context)
@@ -792,6 +813,31 @@ def normalize_tool_input(
         return _normalize_task_output_input(input)
     else:
         return input
+
+
+def _normalize_path_argument_aliases(
+    tool_name: str,
+    input: dict[str, Any],
+) -> dict[str, Any]:
+    target = PATH_ARGUMENT_TARGETS.get(tool_name)
+    if not target or target in input:
+        return input
+
+    alias_keys: list[str] = []
+    for key, value in input.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            continue
+        normalized = key.strip().lstrip("-/").replace("-", "_").lower()
+        if normalized in PATH_ARGUMENT_ALIASES:
+            alias_keys.append(key)
+
+    if len(alias_keys) != 1:
+        return input
+
+    alias = alias_keys[0]
+    result = dict(input)
+    result[target] = result.pop(alias)
+    return result
 
 
 def normalize_tool_input_for_api(
@@ -1054,6 +1100,21 @@ async def run_tool_use(
     pipeline_complete_emitted = False
     tool: BaseTool | None = None
 
+    if os.environ.get("OPENSPACE_DEBUG_TOOL_CALLS", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    }:
+        print(
+            "OPENSPACE_DEBUG run_tool_use "
+            f"tool={tool_name} id={tool_use_id} "
+            f"permission_mode={getattr(context, 'permission_mode', None)} "
+            f"input={_json_preview(tool_input)}",
+            flush=True,
+        )
+
     async def _complete(result: ToolCallResult) -> ToolCallResult:
         nonlocal pipeline_complete_emitted
         nonlocal pipeline_error_type
@@ -1241,6 +1302,9 @@ async def run_tool_use(
             messages=[build_tool_result_stop_message(tool_use_id, tool_name)],
         ))
 
+    tool_input = _normalize_path_argument_aliases(tool.name, tool_input)
+    processed_input_for_evidence = dict(tool_input)
+
     # ── Emit tool_start event ────────────────────────────────────────
     await context.emit_event("tool_start", {
         "tool_name": tool_name,
@@ -1420,6 +1484,19 @@ async def run_tool_use(
             hook_permission_result=hook_permission_result,
         )
         pipeline_permission_status = permission_decision.behavior
+        if os.environ.get("OPENSPACE_DEBUG_TOOL_CALLS", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        }:
+            print(
+                "OPENSPACE_DEBUG permission_decision "
+                f"tool={tool_name} behavior={permission_decision.behavior} "
+                f"mode={getattr(context, 'permission_mode', None)}",
+                flush=True,
+            )
 
         ask_resolution: PermissionAskResolution | None = None
         if permission_decision.behavior != "allow":

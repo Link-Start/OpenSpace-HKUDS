@@ -18,11 +18,13 @@ import { SpinnerWithVerb } from "../components/Spinner.js";
 import { Pane } from "../components/design-system/Pane.js";
 import { useNotifications } from "../context/notifications.js";
 import { useTerminalSize } from "../hooks/useTerminalSize.js";
+import { KeybindingSetup } from "../keybindings/KeybindingProviderSetup.js";
 import { useAppState, useSetAppState } from "../state/AppState.js";
 import {
   isBackspaceInput,
   isDeleteInput,
 } from "../utils/keyInput.js";
+import { truncateToDisplayWidth } from "../utils/textWidth.js";
 import { REPL } from "./REPL.js";
 import {
   formatDateTime,
@@ -40,7 +42,7 @@ type Props = {
 
 type RestoreState = {
   sessionId: string;
-  cost?: number;
+  cost?: number | null;
   messages: ReturnType<typeof normalizeExternalMessages>;
   sessionContext: ReturnType<typeof normalizeSessionContext>;
 };
@@ -104,6 +106,12 @@ function buildRows(sessions: SessionSummary[]): ListRow[] {
   return rows;
 }
 
+function normalizeCost(value: number | null | undefined): number | null {
+  return typeof value === "number" && !Number.isNaN(value)
+    ? value
+    : null;
+}
+
 function windowRows(
   rows: ListRow[],
   selectedIndex: number,
@@ -158,6 +166,10 @@ function SessionListPane({
   searchMode: boolean;
   searchQuery: string;
 }): React.ReactElement {
+  const { columns } = useTerminalSize();
+  const rowWidth = Math.max(24, columns - 8);
+  const titleWidth = Math.max(12, Math.floor(rowWidth * 0.45));
+  const projectWidth = Math.max(10, rowWidth - titleWidth - 5);
   return (
     <Pane>
       <Box
@@ -183,13 +195,17 @@ function SessionListPane({
           }
 
           const selected = row.index === selectedIndex;
-          const projectText = truncate(
-            row.session.project_path || "unknown project",
-            42,
+          const titleText = truncateToDisplayWidth(
+            row.session.title || row.session.session_id,
+            titleWidth,
           );
-          const previewText = truncate(
+          const projectText = truncateToDisplayWidth(
+            row.session.project_path || "unknown project",
+            projectWidth,
+          );
+          const previewText = truncateToDisplayWidth(
             row.session.preview || "No preview",
-            72,
+            rowWidth,
           );
 
           return (
@@ -198,8 +214,8 @@ function SessionListPane({
               flexDirection="column"
               marginBottom={1}
             >
-              <Text color={selected ? "green" : "white"} bold={selected}>
-                {selected ? ">" : " "} {row.session.title || row.session.session_id} | {projectText}
+              <Text color={selected ? "green" : "white"} bold={selected} wrap="truncate">
+                {selected ? ">" : " "} {titleText} | {projectText}
               </Text>
               <Text color="gray">
                 {formatDateTime(row.session.updated_at)} | {row.session.message_count} messages
@@ -209,7 +225,7 @@ function SessionListPane({
                   {row.session.agent_name ?? "main"} · {row.session.mode ?? "default"}
                 </Text>
               ) : null}
-              <Text color={selected ? "cyan" : "gray"}>{previewText}</Text>
+              <Text color={selected ? "cyan" : "gray"} wrap="truncate">{previewText}</Text>
             </Box>
           );
         })}
@@ -225,7 +241,7 @@ export function ResumeConversation({
   const setAppState = useSetAppState();
   const notifications = useAppState(state => state.notifications);
   const { addNotification } = useNotifications();
-  const { rows } = useTerminalSize();
+  const { rows, columns } = useTerminalSize();
 
   const [sessions, setSessions] = React.useState<SessionSummary[]>([]);
   const [loading, setLoading] = React.useState(true);
@@ -290,6 +306,7 @@ export function ResumeConversation({
   const selectedSessionMatchesProject =
     selectedSession?.same_project ??
     sameProject(selectedSession?.project_path);
+  const selectedSessionCost = normalizeCost(selectedSession?.cost);
 
   const restoreSelected = React.useCallback(
     (action: "resume" | "fork"): void => {
@@ -333,7 +350,7 @@ export function ResumeConversation({
           setRestoring(null);
           setRestored({
             sessionId: data.session_id,
-            cost: data.cost,
+            cost: normalizeCost(data.cost),
             messages: normalizeExternalMessages(
               Array.isArray(data.messages) ? data.messages : [],
             ),
@@ -460,15 +477,17 @@ export function ResumeConversation({
 
   if (restored) {
     return (
-      <REPL
-        io={io}
-        initialSessionContext={{
-          sessionId: restored.sessionId,
-          cost: restored.cost,
-          messages: restored.messages,
-          context: restored.sessionContext,
-        }}
-      />
+      <KeybindingSetup>
+        <REPL
+          io={io}
+          initialSessionContext={{
+            sessionId: restored.sessionId,
+            cost: restored.cost,
+            messages: restored.messages,
+            context: restored.sessionContext,
+          }}
+        />
+      </KeybindingSetup>
     );
   }
 
@@ -536,19 +555,26 @@ export function ResumeConversation({
         <Box marginTop={1}>
           <Pane>
             <Text>
-              Selected {selectedIndex + 1}/{filteredSessions.length}: {selectedSession.session_id}
+              Selected {selectedIndex + 1}/{filteredSessions.length}:{" "}
+              {truncateToDisplayWidth(selectedSession.session_id, Math.max(12, columns - 28))}
             </Text>
-            <Text color="gray">
-              Project: {selectedSession.project_path || "unknown"}
+            <Text color="gray" wrap="truncate">
+              Project: {truncateToDisplayWidth(
+                selectedSession.project_path || "unknown",
+                Math.max(12, columns - 14),
+              )}
             </Text>
             {selectedSession.worktree_path ? (
-              <Text color="gray">
-                Worktree: {selectedSession.worktree_path}
+              <Text color="gray" wrap="truncate">
+                Worktree: {truncateToDisplayWidth(
+                  selectedSession.worktree_path,
+                  Math.max(12, columns - 15),
+                )}
               </Text>
             ) : null}
-            {selectedSession.cost !== undefined ? (
+            {selectedSessionCost !== null ? (
               <Text color="gray">
-                Cost: ${selectedSession.cost.toFixed(4)}
+                Cost: ${selectedSessionCost.toFixed(4)}
               </Text>
             ) : null}
             <Text color={selectedSessionMatchesProject ? "green" : "yellow"}>

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import os
+import sys
 from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass, field
@@ -26,6 +27,26 @@ logger = Logger.get_logger(__name__)
 
 _CLEANUP_MEMORY_DRAIN_TIMEOUT_S = 10.0
 _QUALITY_SIGNAL_CUTOVER_CHECKPOINT = "quality_signal_cutover:last_watermark"
+_GENERAL_EVOLUTION_TRIGGER_TYPES = ("ANALYSIS", "MANUAL", "QUALITY_SIGNAL")
+
+
+def _default_evolution_replay_command(*, docker_image: str | None = None) -> list[str]:
+    executable = "python" if docker_image else (sys.executable or "python")
+    return [executable, "-m", "openspace.skill_engine.evolution.eval_worker"]
+
+
+def _runtime_source_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def _evolution_replay_sandbox_manager(workspace_dir: str | Path | None) -> Any | None:
+    try:
+        from openspace.services.sandbox import get_process_sandbox_manager
+
+        return get_process_sandbox_manager(cwd=workspace_dir)
+    except Exception:
+        logger.debug("Evolution replay sandbox manager unavailable", exc_info=True)
+        return None
 
 
 def _new_set_event() -> asyncio.Event:
@@ -98,6 +119,7 @@ class OpenSpaceRuntimeState:
     packet_builder: Any | None = None
     decision_engine: Any | None = None
     evolution_engine: Any | None = None
+    behavior_evaluator: Any | None = None
     candidate_store: Any | None = None
     evolution_storage_root: Path | None = None
     diagnostic_tracker: Any | None = None
@@ -357,7 +379,9 @@ class OpenSpaceRuntime:
                 EvolutionEngine,
                 EvolutionRecovery,
                 EvolutionValidator,
+                SkillBehaviorEvaluator,
                 SkillEvolverAuthoringBackend,
+                SubprocessSkillReplayRunner,
             )
             from openspace.skill_engine.decision import DecisionEngine
             from openspace.skill_engine.evolver import SkillEvolver
@@ -548,6 +572,49 @@ class OpenSpaceRuntime:
                         evidence_store=self.state.evidence_store,
                         trigger_engine=self.state.trigger_engine,
                     )
+                    replay_command = getattr(config, "evolution_replay_command", None)
+                    replay_docker_image = getattr(
+                        config,
+                        "evolution_replay_docker_image",
+                        None,
+                    )
+                    replay_runner = SubprocessSkillReplayRunner(
+                        replay_command
+                        or _default_evolution_replay_command(
+                            docker_image=replay_docker_image,
+                        ),
+                        docker_image=replay_docker_image,
+                        timeout_s=getattr(
+                            config,
+                            "evolution_replay_timeout_s",
+                            600.0,
+                        ),
+                        cwd=getattr(config, "workspace_dir", None),
+                        sandbox_manager=_evolution_replay_sandbox_manager(
+                            getattr(config, "workspace_dir", None),
+                        ),
+                        pythonpath_roots=(_runtime_source_root(),),
+                    )
+                    self.state.behavior_evaluator = SkillBehaviorEvaluator(
+                        evidence_store=self.state.evidence_store,
+                        llm_client=self.state.llm_client,
+                        replay_runner=replay_runner,
+                        enable_routing_eval=getattr(
+                            config,
+                            "evolution_routing_eval_enabled",
+                            True,
+                        ),
+                        require_routing_eval=getattr(
+                            config,
+                            "evolution_routing_eval_required",
+                            False,
+                        ),
+                        require_replay_runner=getattr(
+                            config,
+                            "evolution_behavior_eval_require_replay_runner",
+                            True,
+                        ),
+                    )
                     self.state.evidence_runtime_adapter = RuntimeEvidenceAdapter(
                         self.state.evidence_store,
                         trigger_engine=self.state.trigger_engine,
@@ -583,12 +650,23 @@ class OpenSpaceRuntime:
                         evidence_store=self.state.evidence_store,
                         skill_store=self.state.skill_store,
                         registry=self.state.skill_registry,
+                        allow_single_observation_capture=getattr(
+                            config,
+                            "evolution_allow_single_observation_capture",
+                            False,
+                        ),
                     ),
                     candidate_store=self.state.candidate_store,
                     validator=EvolutionValidator(
                         evidence_store=self.state.evidence_store,
                         skill_store=self.state.skill_store,
                         registry=self.state.skill_registry,
+                    ),
+                    behavior_evaluator=self.state.behavior_evaluator,
+                    behavior_eval_max_revisions=getattr(
+                        config,
+                        "evolution_behavior_eval_max_revisions",
+                        2,
                     ),
                     evolution_mode=getattr(config, "evolution_mode", "autonomous"),
                 )
@@ -701,6 +779,12 @@ class OpenSpaceRuntime:
                         )
                     if validator is not None and hasattr(validator, "registry"):
                         validator.registry = self.state.skill_registry
+                    behavior_evaluator = self.state.behavior_evaluator
+                    if behavior_evaluator is not None and hasattr(
+                        behavior_evaluator,
+                        "registry",
+                    ):
+                        behavior_evaluator.registry = self.state.skill_registry
                     self.state.grounding_agent.set_skill_registry(
                         self.state.skill_registry
                     )
@@ -746,6 +830,12 @@ class OpenSpaceRuntime:
                             )
                         if validator is not None and hasattr(validator, "skill_store"):
                             validator.skill_store = skill_store
+                        behavior_evaluator = self.state.behavior_evaluator
+                        if behavior_evaluator is not None and hasattr(
+                            behavior_evaluator,
+                            "skill_store",
+                        ):
+                            behavior_evaluator.skill_store = skill_store
                         evidence_adapter = self.state.evidence_runtime_adapter
                         set_evidence_sink = getattr(skill_store, "set_evidence_sink", None)
                         if evidence_adapter is not None and callable(set_evidence_sink):
@@ -872,6 +962,7 @@ class OpenSpaceRuntime:
                 )
                 if result is not None:
                     logger.info("✓ Evolution startup recovery: %s", result.to_dict())
+                await self.maybe_drain_startup_retryable_evolution_jobs()
 
             self.propagate_service_hooks()
 
@@ -1748,10 +1839,24 @@ class OpenSpaceRuntime:
     async def drain_post_execution_tasks(self) -> None:
         if not self.state.post_execution_tasks:
             return
-        await asyncio.gather(
-            *list(self.state.post_execution_tasks),
-            return_exceptions=True,
-        )
+        tasks = list(self.state.post_execution_tasks)
+        drain = asyncio.gather(*tasks, return_exceptions=True)
+        timeout_s = self.post_execution_timeout_s()
+        if timeout_s > 0:
+            try:
+                await asyncio.wait_for(drain, timeout=timeout_s)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Post-execution background drain timed out after %.2fs; "
+                    "cancelling unfinished tasks",
+                    timeout_s,
+                )
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.wait(tasks, timeout=1.0)
+        else:
+            await drain
         self.state.post_execution_tasks.clear()
 
     async def drain_memory_background_tasks(
@@ -1811,6 +1916,19 @@ class OpenSpaceRuntime:
             return "inline"
         return mode
 
+    def post_execution_timeout_s(self) -> float:
+        try:
+            return max(
+                0.0,
+                float(getattr(self.config, "post_execution_timeout_s", 0.0) or 0.0),
+            )
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid post_execution_timeout_s=%r; disabling timeout",
+                getattr(self.config, "post_execution_timeout_s", None),
+            )
+            return 0.0
+
     async def run_post_execution_tasks(
         self,
         task_id: str,
@@ -1853,6 +1971,15 @@ class OpenSpaceRuntime:
                 )
         candidate_outcomes = await self.maybe_drain_candidate_rechecks()
         for outcome in candidate_outcomes:
+            for record in getattr(outcome, "evolved_skill_records", []) or []:
+                task_evolved_skills.append(
+                    self.evolved_skill_record_from_evolution(record)
+                )
+        final_outcomes = await self.maybe_drain_final_evolution_jobs(
+            task_id=task_id,
+            session_id=session_id,
+        )
+        for outcome in final_outcomes:
             for record in getattr(outcome, "evolved_skill_records", []) or []:
                 task_evolved_skills.append(
                     self.evolved_skill_record_from_evolution(record)
@@ -1916,6 +2043,7 @@ class OpenSpaceRuntime:
         job_ids: list[str] | None = None,
         trigger_types: tuple[str, ...] | None = None,
         scope: Any | None = None,
+        claim_statuses: tuple[str, ...] | None = None,
         limit: int = 1,
     ) -> list[Any]:
         trigger_engine = self.state.trigger_engine
@@ -1938,11 +2066,16 @@ class OpenSpaceRuntime:
                             worker_id=worker_id,
                             trigger_types=trigger_types,
                             scope=scope,
+                            claim_statuses=claim_statuses,
                         )
                         or []
                     )
                 except TypeError:
-                    if trigger_types is not None or scope is not None:
+                    if (
+                        trigger_types is not None
+                        or scope is not None
+                        or claim_statuses is not None
+                    ):
                         return []
                     jobs = list(
                         trigger_engine.claim_next(
@@ -1957,8 +2090,16 @@ class OpenSpaceRuntime:
 
         outcomes: list[Any] = []
         for job in jobs:
+            outcome = None
             try:
                 outcome = await evolution_engine.process_job(job)
+            except asyncio.CancelledError:
+                self._complete_cancelled_evolution_job(
+                    trigger_engine=trigger_engine,
+                    job=job,
+                    outcome=outcome,
+                )
+                raise
             except Exception as exc:
                 logger.debug(
                     "Evolution job processing failed for %s",
@@ -1998,6 +2139,13 @@ class OpenSpaceRuntime:
                         result_ref=completion.result_ref,
                         error=completion.error,
                     )
+            except asyncio.CancelledError:
+                self._complete_cancelled_evolution_job(
+                    trigger_engine=trigger_engine,
+                    job=job,
+                    outcome=outcome,
+                )
+                raise
             except Exception:
                 logger.debug(
                     "Evolution trigger job completion failed for %s",
@@ -2005,6 +2153,47 @@ class OpenSpaceRuntime:
                     exc_info=True,
                 )
         return outcomes
+
+    def _complete_cancelled_evolution_job(
+        self,
+        *,
+        trigger_engine: Any,
+        job: Any,
+        outcome: Any | None,
+    ) -> None:
+        job_id = str(getattr(job, "job_id", "") or "")
+        if not job_id or self._trigger_job_already_terminal(job):
+            return
+        status = "failed_retryable"
+        result_ref = None
+        error = "evolution job cancelled before completion"
+        if outcome is not None:
+            try:
+                from openspace.skill_engine.evolution import completion_from_outcome
+
+                completion = completion_from_outcome(outcome)
+                status = completion.status
+                result_ref = completion.result_ref
+                error = completion.error or error
+            except Exception:
+                logger.debug(
+                    "Evolution cancellation completion mapping failed for %s",
+                    job_id,
+                    exc_info=True,
+                )
+        try:
+            trigger_engine.complete(
+                job_id,
+                status=status,
+                result_ref=result_ref,
+                error=error,
+            )
+        except Exception:
+            logger.debug(
+                "Evolution trigger job cancellation completion failed for %s",
+                job_id,
+                exc_info=True,
+            )
 
     def _trigger_job_already_terminal(self, job: Any) -> bool:
         job_id = str(getattr(job, "job_id", "") or "")
@@ -2059,7 +2248,7 @@ class OpenSpaceRuntime:
         )
 
     def _candidate_recheck_cutover_enabled(self) -> bool:
-        """Only autonomous runtimes should auto-promote queued candidates."""
+        """Allow queued candidates to re-enter eval-capable modes."""
 
         evolution_engine = self.state.evolution_engine
         mode = str(
@@ -2067,7 +2256,7 @@ class OpenSpaceRuntime:
             or getattr(self.config, "evolution_mode", "autonomous")
             or "autonomous"
         ).strip().lower()
-        return mode == "autonomous" and self._quality_cutover_enabled()
+        return mode in {"autonomous", "fix_only"} and self._quality_cutover_enabled()
 
     def schedule_post_execution_tasks(
         self,
@@ -2286,6 +2475,148 @@ class OpenSpaceRuntime:
             limit=len(job_ids),
         )
 
+    async def maybe_drain_startup_retryable_evolution_jobs(self) -> list[Any]:
+        """Optionally retry persisted failed_retryable jobs during startup."""
+
+        limit = int(
+            getattr(
+                self.config,
+                "evolution_startup_retryable_drain_limit",
+                0,
+            )
+            or 0
+        )
+        rounds = int(
+            getattr(
+                self.config,
+                "evolution_startup_retryable_drain_rounds",
+                1,
+            )
+            or 0
+        )
+        timeout_s = float(
+            getattr(
+                self.config,
+                "evolution_startup_retryable_drain_timeout_s",
+                0.0,
+            )
+            or 0.0
+        )
+        raw_statuses = getattr(
+            self.config,
+            "evolution_startup_retryable_drain_statuses",
+            "failed_retryable",
+        )
+        if isinstance(raw_statuses, str):
+            claim_statuses = tuple(
+                item.strip() for item in raw_statuses.split(",") if item.strip()
+            )
+        else:
+            claim_statuses = tuple(
+                str(item).strip() for item in raw_statuses if str(item).strip()
+            )
+        if not claim_statuses:
+            claim_statuses = ("failed_retryable",)
+        if limit <= 0 or rounds <= 0:
+            return []
+        if self.state.trigger_engine is None or self.state.evolution_engine is None:
+            return []
+
+        outcomes: list[Any] = []
+        for _ in range(rounds):
+            try:
+                drain_coro = self.drain_evolution_jobs(
+                    claim_statuses=claim_statuses,
+                    trigger_types=_GENERAL_EVOLUTION_TRIGGER_TYPES,
+                    limit=limit,
+                )
+                if timeout_s > 0:
+                    batch = await asyncio.wait_for(drain_coro, timeout=timeout_s)
+                else:
+                    batch = await drain_coro
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Startup retryable evolution drain timed out after %.2fs",
+                    timeout_s,
+                )
+                break
+            except Exception:
+                logger.debug("Startup retryable evolution drain failed", exc_info=True)
+                break
+
+            if not batch:
+                break
+            outcomes.extend(batch)
+            if len(batch) < limit:
+                break
+
+        if outcomes:
+            logger.info(
+                "Startup retryable evolution drain processed %s job(s)",
+                len(outcomes),
+            )
+        return outcomes
+
+    async def maybe_drain_final_evolution_jobs(
+        self,
+        *,
+        task_id: str,
+        session_id: str | None = None,
+    ) -> list[Any]:
+        """Optionally retry open evolution jobs before short-lived runtimes exit."""
+
+        limit = int(getattr(self.config, "evolution_final_drain_limit", 0) or 0)
+        rounds = int(getattr(self.config, "evolution_final_drain_rounds", 1) or 0)
+        timeout_s = float(
+            getattr(self.config, "evolution_final_drain_timeout_s", 0.0) or 0.0
+        )
+        if limit <= 0 or rounds <= 0:
+            return []
+        if self.state.trigger_engine is None or self.state.evolution_engine is None:
+            return []
+
+        try:
+            from openspace.skill_engine.evidence import EvidenceScope
+
+            scope = EvidenceScope(
+                session_id=session_id or self.current_session_id,
+                task_id=task_id,
+            )
+        except Exception:
+            logger.debug("Final evolution drain scope unavailable", exc_info=True)
+            scope = None
+
+        outcomes: list[Any] = []
+        for _ in range(rounds):
+            try:
+                drain_coro = self.drain_evolution_jobs(
+                    scope=scope,
+                    trigger_types=_GENERAL_EVOLUTION_TRIGGER_TYPES,
+                    limit=limit,
+                )
+                if timeout_s > 0:
+                    batch = await asyncio.wait_for(drain_coro, timeout=timeout_s)
+                else:
+                    batch = await drain_coro
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Final evolution drain timed out after %.2fs", timeout_s
+                )
+                break
+            except Exception:
+                logger.debug("Final evolution drain failed", exc_info=True)
+                break
+
+            if not batch:
+                break
+            outcomes.extend(batch)
+            if len(batch) < limit:
+                break
+
+        if outcomes:
+            logger.info("Final evolution drain processed %s job(s)", len(outcomes))
+        return outcomes
+
     def _load_quality_signal_cutover_checkpoint(self) -> int:
         trigger_engine = self.state.trigger_engine
         for owner in (
@@ -2343,7 +2674,7 @@ class OpenSpaceRuntime:
         if mode == "audit_only":
             return True
 
-        for name in ("authoring_backend", "validator", "committer"):
+        for name in ("authoring_backend", "validator", "behavior_evaluator", "committer"):
             if self._evolution_component(evolution_engine, name, None) is None:
                 return False
         return True

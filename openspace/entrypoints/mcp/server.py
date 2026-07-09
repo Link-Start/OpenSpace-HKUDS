@@ -862,7 +862,6 @@ async def cloud_browse_skills(
     local_category_path: str | None = None,
     limit: int = 8,
     audience: str = "requester_visible",
-    mode: str = "auto",
     artifact_filter: str = "downloadable_only",
     max_packages_per_pull: int = 40,
     max_skills_per_pull: int = 40,
@@ -874,25 +873,29 @@ async def cloud_browse_skills(
     step. The agent continues by calling this same tool with the next action.
 
     Recommended action order:
+      1. ``search_skills`` with ``query`` to rank concrete downloadable skills.
+         Optionally pass ``package_id`` to restrict search to one package subtree.
+      2. ``fetch_skill_detail`` with ``cloud_skill_id`` when exact metadata is
+         needed before import.
+      3. ``local_placement`` to choose or create a local package taxonomy path.
+      4. ``import_skill`` with ``cloud_skill_id`` and ``local_category_path`` to
+         download/register the selected skill locally.
+
+    Optional package discovery actions:
       1. ``recall`` with ``query`` to get package candidates and ``search_id``.
       2. ``pull_projection`` with ``search_id`` + selected ``package_ids`` to
          inspect JSON package projections and record package-selection telemetry.
-      3. ``search_package_skills`` with ``package_id`` + ``query`` to rank
-         concrete downloadable skills inside the chosen package.
-      4. ``fetch_skill_detail`` with ``cloud_skill_id`` when exact metadata is
-         needed before import.
-      5. ``local_placement`` to choose or create a local package taxonomy path.
-      6. ``import_skill`` with ``cloud_skill_id`` and ``local_category_path`` to
-         download/register the selected skill locally.
+      3. ``search_skills`` with ``package_id`` to run skill-first search scoped
+         to a chosen package.
 
     Optional: ``import_package_bundle`` with ``package_id`` downloads a selected
     package bundle when the agent needs outline files or bundled artifacts.
 
     Args:
-        action: One of ``local_placement``, ``local_taxonomy``, ``recall``, ``pull_projection``,
-                ``search_package_skills``, ``fetch_skill_detail``,
+        action: One of ``local_placement``, ``local_taxonomy``, ``recall``,
+                ``pull_projection``, ``search_skills``, ``fetch_skill_detail``,
                 ``import_skill``, or ``import_package_bundle``.
-        query: Query text for ``recall`` and ``search_package_skills``.
+        query: Query text for ``search_skills`` and ``recall``.
         search_id: ``search_id`` returned by ``recall``.
         package_ids: Selected package ids for ``pull_projection``.
         package_id: One selected package id for package-local actions.
@@ -917,8 +920,8 @@ async def cloud_browse_skills(
         "pull": "pull_projection",
         "projection": "pull_projection",
         "package_projection": "pull_projection",
-        "search_skills": "search_package_skills",
-        "package_skills": "search_package_skills",
+        "skill_search": "search_skills",
+        "global_skill_search": "search_skills",
         "fetch": "fetch_skill_detail",
         "detail": "fetch_skill_detail",
         "import": "import_skill",
@@ -954,13 +957,12 @@ async def cloud_browse_skills(
             max_packages_per_pull=max_packages_per_pull,
             max_skills_per_pull=max_skills_per_pull,
         )
-    if normalized_action == "search_package_skills":
-        return await cloud_search_package_skills(
-            package_id=package_id or "",
+    if normalized_action == "search_skills":
+        return await cloud_search_skills(
             query=query or "",
+            package_id=package_id,
             limit=limit,
             audience=audience,
-            mode=mode,
             artifact_filter=artifact_filter,
         )
     if normalized_action == "fetch_skill_detail":
@@ -989,7 +991,7 @@ async def cloud_browse_skills(
             "local_taxonomy",
             "recall",
             "pull_projection",
-            "search_package_skills",
+            "search_skills",
             "fetch_skill_detail",
             "import_skill",
             "import_package_bundle",
@@ -997,7 +999,7 @@ async def cloud_browse_skills(
         "recommended_sequence": [
             "recall",
             "pull_projection",
-            "search_package_skills",
+            "search_skills",
             "fetch_skill_detail",
             "local_placement",
             "import_skill",
@@ -1312,7 +1314,7 @@ async def cloud_recall_packages(
                 },
                 {
                     "tool": "cloud_browse_skills",
-                    "action": "search_package_skills",
+                    "action": "search_skills",
                     "reason": "Narrow a known package directly to concrete downloadable skills.",
                     "required_fields": ["package_id", "query"],
                 },
@@ -1369,7 +1371,7 @@ async def cloud_pull_package_projection(
             "next_actions": [
                 {
                     "tool": "cloud_browse_skills",
-                    "action": "search_package_skills",
+                    "action": "search_skills",
                     "reason": "Search concrete skills inside a chosen root_package_id.",
                     "required_fields": ["package_id", "query"],
                 },
@@ -1405,35 +1407,27 @@ async def cloud_pull_package_projection(
         return _json_error(e, status="error")
 
 
-async def cloud_search_package_skills(
-    package_id: str,
+async def cloud_search_skills(
     query: str,
+    package_id: str | None = None,
     limit: int = 10,
     audience: str = "requester_visible",
-    mode: str = "auto",
     artifact_filter: str = "downloadable_only",
 ) -> str:
-    """Search concrete skills inside one chosen package subtree.
-
-    This calls ``POST /api/v2/packages/{package_id}/skills/search`` and returns
-    skill candidates for the LLM to inspect before importing.
-    """
+    """Search concrete cloud skills through ``POST /api/v2/skills/search``."""
 
     try:
-        pkg = str(package_id or "").strip()
         q = str(query or "").strip()
-        if not pkg:
-            return _json_error("package_id is required")
+        pkg = str(package_id or "").strip()
         if not q:
             return _json_error("query is required")
         client = _get_cloud_client()
         payload = await asyncio.to_thread(
-            client.search_package_skills,
-            pkg,
+            client.search_skills,
             query=q,
+            package_id=pkg or None,
             audience=audience,
             limit=min(max(int(limit), 1), 50),
-            mode=mode,
             artifact_filter=artifact_filter,
         )
         results = [
@@ -1443,15 +1437,18 @@ async def cloud_search_package_skills(
         ]
         return _json_ok({
             "status": "success",
+            "endpoint": "/api/v2/skills/search",
             "package_id": pkg,
             "query": q,
+            "audience": payload.get("audience", audience),
             "root_package_id": payload.get("root_package_id", pkg),
             "root_package_path": payload.get("root_package_path", ""),
             "skill_search_id": payload.get("skill_search_id", ""),
-            "requested_mode": payload.get("requested_mode", mode),
+            "requested_mode": payload.get("requested_mode", ""),
             "served_mode": payload.get("served_mode", ""),
             "semantic_status": payload.get("semantic_status", ""),
             "fallback_reason": payload.get("fallback_reason", ""),
+            "artifact_filter": artifact_filter,
             "results": results,
             "count": len(results),
             "next_actions": [
@@ -1477,7 +1474,7 @@ async def cloud_search_package_skills(
             ],
         })
     except Exception as e:
-        logger.error("cloud_search_package_skills failed: %s", e, exc_info=True)
+        logger.error("cloud_search_skills failed: %s", e, exc_info=True)
         return _json_error(e, status="error")
 
 
@@ -2468,7 +2465,7 @@ def _upload_package_children(
 @mcp.tool()
 async def upload_skill(
     skill_dir: str,
-    visibility: str = "public",
+    visibility: str = "private",
     cloud_package_path: str | None = None,
     cloud_package_id: str | None = None,
     cloud_parent_package_id: str | None = None,
@@ -2489,7 +2486,7 @@ async def upload_skill(
     metadata is **pre-saved** in ``.upload_meta.json``.  The bot provides:
 
       - ``skill_dir`` — path to the skill directory
-      - ``visibility`` — "public" or "private"
+      - ``visibility`` — "private" by default, or "public" when explicitly sharing
       - package placement for non-fix uploads without pre-saved placement
 
     For non-fix uploads, this tool is also the agent-facing cloud package
@@ -2508,8 +2505,8 @@ async def upload_skill(
 
     Args:
         skill_dir: Path to skill directory (must contain SKILL.md).
-        visibility: "public" or "private".  This is the one thing the
-                    bot MUST decide.
+        visibility: "public" or "private". Defaults to "private"; choose
+                    "public" only when explicitly sharing.
         cloud_package_path: Agent-selected existing regular package path, or
                             one new child regular package segment under an
                             eligible parent. Required for non-fix uploads

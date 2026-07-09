@@ -288,8 +288,18 @@ export interface CandidateRecheckResult {
 export interface WorkflowSummary {
   id: string;
   path: string;
+  log_root?: string | null;
+  log_root_label?: string | null;
+  log_folder?: string | null;
+  log_folder_label?: string | null;
+  log_relative_path?: string | null;
   task_id: string;
   task_name: string;
+  recording_task_id?: string | null;
+  benchmark_task_id?: string | null;
+  benchmark_task_run_id?: string | null;
+  benchmark_run_name?: string | null;
+  instruction_source?: string | null;
   instruction: string;
   status: string;
   iterations: number;
@@ -326,6 +336,53 @@ export interface WorkflowTimelineEvent {
   details: Record<string, unknown>;
 }
 
+export interface WorkflowTraceDatum {
+  label: string;
+  kind: string;
+  preview: string;
+  value: unknown;
+}
+
+export interface WorkflowTraceEvent {
+  event_id: string;
+  sequence: number;
+  timestamp: string;
+  iteration?: number | null;
+  harness: string;
+  source: string;
+  title: string;
+  summary: string;
+  based_on: string[];
+  decision: string;
+  impact: string;
+  status?: string | null;
+  agent_name?: string | null;
+  tool_name?: string | null;
+  backend?: string | null;
+  inputs: WorkflowTraceDatum[];
+  outputs: WorkflowTraceDatum[];
+  metadata: Record<string, unknown>;
+  raw: Record<string, unknown>;
+}
+
+export interface WorkflowTraceSummary {
+  total_events: number;
+  harness_counts: Record<string, number>;
+  agents: string[];
+  tools: string[];
+  iterations: number[];
+  has_conversation_log: boolean;
+  has_agent_actions: boolean;
+  has_tool_trajectory: boolean;
+  source_files: Record<string, string>;
+  workflow_id: string;
+}
+
+export interface WorkflowTrace {
+  summary: WorkflowTraceSummary;
+  events: WorkflowTraceEvent[];
+}
+
 export interface WorkflowDetail extends WorkflowSummary {
   metadata: Record<string, unknown>;
   statistics: {
@@ -345,6 +402,7 @@ export interface WorkflowDetail extends WorkflowSummary {
     by_type: Record<string, number>;
   };
   timeline: WorkflowTimelineEvent[];
+  trace?: WorkflowTrace;
   artifacts: {
     init_screenshot_url: string | null;
     screenshots: WorkflowArtifact[];

@@ -98,17 +98,22 @@ Recommended flow:
 
 ```
 cloud_browse_skills(
-  action="recall",
+  action="search_skills",
   query="browser login automation",
   limit=5
 )
 ```
 
-Inspect `results[]`: each item has `package_id`, `package_path`, `summary_line`, and `preview_entries`.
+Inspect `results[]`: each item has `cloud_skill_id`, `title`, `summary`, `package_id`, and `package_path`.
 
-Then pull selected package projections using the returned `search_id`:
+Use package discovery only when you need package outlines before choosing a skill:
 
 ```
+cloud_browse_skills(
+  action="recall",
+  query="browser login automation",
+  limit=5
+)
 cloud_browse_skills(
   action="pull_projection",
   search_id="<search_id>",
@@ -118,11 +123,11 @@ cloud_browse_skills(
 
 Inspect `pulls[].packages[]`, `pulls[].skills[]`, `projection_hash`, and `root_package_path`. This is JSON projection, not the real zip files.
 
-If you need concrete skill ranking inside one package:
+If you need concrete skill ranking inside one package, use the scoped skill-first search:
 
 ```
 cloud_browse_skills(
-  action="search_package_skills",
+  action="search_skills",
   package_id="<package_id>",
   query="browser login automation"
 )
@@ -208,7 +213,7 @@ New cloud package paths are allowed, but only as one new regular package segment
 ```
 upload_skill(
   skill_dir="/path/to/skills/weather-api",
-  visibility="public",
+  visibility="private",
   cloud_package_path="Technology/Computing/API clients"
 )
 ```
@@ -216,7 +221,7 @@ upload_skill(
 | Parameter | Required | Default | Description |
 |-----------|----------|---------|-------------|
 | `skill_dir` | yes | — | Path to skill directory (must contain SKILL.md) |
-| `visibility` | no | `"public"` | `"public"` or `"private"` |
+| `visibility` | no | `"private"` | `"public"` or `"private"` |
 | `cloud_package_path` | for non-fix uploads without saved placement | auto | Agent-selected existing regular package path, or one new child regular package segment under an eligible parent |
 | `cloud_sub_domain_package_id` | no | — | Browse one upload subtree before selecting/creating `cloud_package_path` |
 | `cloud_package_query` | no | — | Filter cloud package picker results |
@@ -229,8 +234,8 @@ upload_skill(
 
 | Situation | Action |
 |-----------|--------|
-| Skill was originally from the cloud | Upload back as `"public"` — return the improvement to the community |
-| Fix/evolution is generally useful | Upload as `"public"` |
+| Skill was originally from the cloud | Upload as `"private"` unless the user explicitly asks to share the improvement |
+| Fix/evolution is generally useful | Upload as `"private"` during testing; use `"public"` only with explicit sharing intent |
 | Fix/evolution is project-specific | Upload as `"private"`, or skip |
 | User says to share | Upload with the visibility the user wants |
 

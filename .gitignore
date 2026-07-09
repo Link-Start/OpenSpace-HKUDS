@@ -51,6 +51,9 @@ logs/
 # GDPVal reference file cache (pre-downloaded from HuggingFace)
 benchmarks/gdpval/ref_cache/
 
+# Terminal-Bench benchmark harness is not part of this release
+benchmarks/terminal_bench/
+
 # Embedding cache - root level fully ignored
 /.openspace/
 # GDPVal benchmark cache
@@ -82,7 +85,6 @@ examples/*/node_modules/
 
 # Skills
 openspace/skills/*
-!openspace/skills/README.md
 !openspace/skills/remember/
 !openspace/skills/remember/SKILL.md
 !openspace/skills/remember/.skill_id

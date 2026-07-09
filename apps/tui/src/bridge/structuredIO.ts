@@ -71,8 +71,9 @@ export class StructuredIO {
   >();
 
   /**
-   * Set of tool_use_ids that have already been resolved. Prevents
-   * duplicate permission_request events from spawning multiple prompts.
+   * Set of tool_use_ids with an active prompt already delivered to the UI.
+   * Cleared on resolve/reject so edited-input retry flows can ask again with
+   * the same tool_use_id after Core rechecks permissions.
    */
   readonly seenToolUseIds = new Set<string>();
 
@@ -223,6 +224,7 @@ export class StructuredIO {
     for (const [id, pending] of this.pendingPermissions) {
       pending.reject(new Error(reason));
       this.pendingPermissions.delete(id);
+      this.seenToolUseIds.delete(id);
     }
   }
 
@@ -252,6 +254,8 @@ export class StructuredIO {
   }
 
   private finalizePermission(response: PermissionDecisionResponse): void {
+    this.seenToolUseIds.delete(response.tool_use_id);
+
     const pending = this.pendingPermissions.get(response.tool_use_id);
     if (!pending) return;
 

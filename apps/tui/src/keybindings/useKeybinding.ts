@@ -70,7 +70,7 @@ export function useKeybindings(
 }
 
 export function useKeybindingInput(
-  handler: (input: string, key: Key) => void,
+  handler: (input: string, key: Key) => void | false,
   options: Options = {},
 ): void {
   const { context = "Chat", isActive = true } = options;
@@ -88,9 +88,7 @@ export function useKeybindingInput(
 
     return keybindingContext.registerInputHandler({
       context,
-      handler: (input, key) => {
-        handlerRef.current(input, key);
-      },
+      handler: (input, key) => handlerRef.current(input, key),
     });
   }, [context, isActive, keybindingContext]);
 }

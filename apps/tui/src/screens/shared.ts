@@ -120,8 +120,8 @@ export function flattenMessageContent(
     .trim();
 }
 
-export function formatUsd(cost: number | undefined): string {
-  if (cost === undefined || Number.isNaN(cost)) {
+export function formatUsd(cost: number | null | undefined): string {
+  if (typeof cost !== "number" || Number.isNaN(cost)) {
     return "n/a";
   }
 

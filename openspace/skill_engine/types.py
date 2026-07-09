@@ -119,28 +119,36 @@ class SkillLineage:
     """
 
     origin: SkillOrigin
+    revision_id: str = ""                                  # Usually equal to SkillRecord.skill_id
     generation: int = 0                                    # Distance from root (see docstring)
     parent_skill_ids: List[str] = field(default_factory=list)  # [] for IMPORTED / CAPTURED
+    parent_revision_ids: List[str] = field(default_factory=list)  # Explicit revision DAG edges
     source_task_id: Optional[str] = None                   # Task that triggered evolution / capture
     change_summary: str = ""                               # LLM-generated description of changes
+    content_hash: str = ""                                  # Stable hash of content_snapshot
     content_diff: str = ""                                 # Combined unified diff of all files (empty for multi-parent DERIVED)
     content_snapshot: Dict[str, str] = field(default_factory=dict)  # {relative_path: content} full directory snapshot
     evolution_action_id: Optional[str] = None              # EvolutionActionRecord that committed this version
     provenance_refs: List[str] = field(default_factory=list)  # Minimal evidence refs for quick lineage lookup
+    revision_metadata: Dict[str, Any] = field(default_factory=dict)
     created_at: datetime = field(default_factory=datetime.now)
     created_by: str = ""                                   # "human" | model name (version-level actor)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "origin": self.origin.value,
+            "revision_id": self.revision_id,
             "generation": self.generation,
             "parent_skill_ids": self.parent_skill_ids,
+            "parent_revision_ids": self.parent_revision_ids,
             "source_task_id": self.source_task_id,
             "change_summary": self.change_summary,
+            "content_hash": self.content_hash,
             "content_diff": self.content_diff,
             "content_snapshot": self.content_snapshot,
             "evolution_action_id": self.evolution_action_id,
             "provenance_refs": self.provenance_refs,
+            "revision_metadata": self.revision_metadata,
             "created_at": self.created_at.isoformat(),
             "created_by": self.created_by,
         }
@@ -149,14 +157,18 @@ class SkillLineage:
     def from_dict(cls, data: Dict[str, Any]) -> "SkillLineage":
         return cls(
             origin=SkillOrigin(data["origin"]),
+            revision_id=data.get("revision_id", ""),
             generation=data.get("generation", 0),
             parent_skill_ids=data.get("parent_skill_ids", []),
+            parent_revision_ids=data.get("parent_revision_ids", data.get("parent_skill_ids", [])),
             source_task_id=data.get("source_task_id"),
             change_summary=data.get("change_summary", ""),
+            content_hash=data.get("content_hash", ""),
             content_diff=data.get("content_diff", ""),
             content_snapshot=data.get("content_snapshot", {}),
             evolution_action_id=data.get("evolution_action_id"),
             provenance_refs=data.get("provenance_refs", []),
+            revision_metadata=data.get("revision_metadata", {}),
             created_at=(
                 datetime.fromisoformat(data["created_at"])
                 if data.get("created_at") else datetime.now()

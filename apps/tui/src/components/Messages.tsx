@@ -395,6 +395,14 @@ export function Messages({
         scrollToIndex(index);
         selectIndex(index, true);
       },
+      jumpToMessageId(id: string) {
+        const index = renderableMessages.findIndex(message => message.id === id);
+        if (index < 0) {
+          return;
+        }
+        scrollToIndex(index);
+        selectIndex(index, true);
+      },
       setSearchQuery(query: string) {
         recomputeSearchMatches(query);
       },
@@ -456,6 +464,7 @@ export function Messages({
       loweredSearchTexts.length,
       onSearchMatchesChange,
       recomputeSearchMatches,
+      renderableMessages,
       scrollToIndex,
       selectIndex,
     ],

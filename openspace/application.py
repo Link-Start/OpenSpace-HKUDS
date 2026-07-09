@@ -33,6 +33,7 @@ def _configure_logging_from_config(config: "OpenSpaceConfig") -> None:
     log_to_file = config.log_file_path or "auto" if config.log_to_file else None
     Logger.configure(
         level=config.log_level,
+        log_to_console=config.log_to_console,
         log_to_file=log_to_file,
         force=True,
         attach_to_root=True,
@@ -140,6 +141,7 @@ class OpenSpaceConfig:
     
     # Workspace Configuration
     workspace_dir: Optional[str] = None
+    capture_skill_dir: Optional[str] = None
     session_storage_dir: Optional[str] = None
     
     # Recording Configuration
@@ -150,6 +152,7 @@ class OpenSpaceConfig:
     enable_video: bool = False
     enable_conversation_log: bool = True  # Save LLM conversations to conversations.jsonl
     post_execution_mode: str = "inline"  # inline | background | disabled
+    post_execution_timeout_s: float = 0.0
     memory_drain_timeout_s: Optional[float] = None
 
     # Low-latency runtime controls.
@@ -157,6 +160,13 @@ class OpenSpaceConfig:
     low_latency_enabled: bool = False
     low_latency_profiler_only: bool = True
     hard_active_tool_limit: int = 500
+    max_result_size_chars: Optional[int] = None
+    max_tool_results_per_message_chars: Optional[int] = None
+    active_tool_names: Optional[List[str]] = None
+    policy_deferred_tool_names: Optional[List[str]] = None
+    tool_retrieval_query: Optional[str] = None
+    skills_disabled: bool = False
+    memory_mode: Optional[str] = None
     fast_tool_policy_enabled: bool = False
     disable_fast_auto_preselection: bool = False
     disable_turn0_llm_skill_selector: bool = False
@@ -179,18 +189,81 @@ class OpenSpaceConfig:
     evolution_triggers_enabled: bool = True
     evolution_engine_enabled: bool = True
     evolution_mode: str = "autonomous"  # audit_only | fix_only | autonomous
+    evolution_allow_single_observation_capture: bool = False
     evolution_candidate_recheck_drain_limit: int = 2
+    evolution_final_drain_limit: int = 0
+    evolution_final_drain_rounds: int = 1
+    evolution_final_drain_timeout_s: float = 0.0
+    evolution_startup_retryable_drain_limit: int = 0
+    evolution_startup_retryable_drain_rounds: int = 1
+    evolution_startup_retryable_drain_timeout_s: float = 0.0
+    evolution_startup_retryable_drain_statuses: str = "failed_retryable"
+    evolution_recovery_stale_job_timeout_s: float = 30 * 60
+    evolution_behavior_eval_max_revisions: int = 2
+    evolution_routing_eval_enabled: bool = True
+    evolution_routing_eval_required: bool = False
+    evolution_behavior_eval_require_replay_runner: bool = True
+    evolution_replay_command: Optional[str] = None
+    evolution_replay_docker_image: Optional[str] = None
+    evolution_replay_timeout_s: float = 600.0
     quality_signal_detector_enabled: bool = True
     quality_signal_trigger_enabled: bool = True
     quality_signal_reconciliation_enabled: bool = True
     
     # Logging Configuration
     log_level: str = "INFO"
+    log_to_console: bool = True
     log_to_file: bool = False
     log_file_path: Optional[str] = None
     
     def __post_init__(self):
         """Validate configuration"""
+        env_capture_skill_dir = os.environ.get("OPENSPACE_CAPTURE_SKILL_DIR")
+        self.capture_skill_dir = self.capture_skill_dir or env_capture_skill_dir
+        if self.capture_skill_dir is not None:
+            capture_skill_dir = str(self.capture_skill_dir).strip()
+            self.capture_skill_dir = capture_skill_dir or None
+
+        env_post_execution_timeout = os.environ.get("OPENSPACE_POST_EXECUTION_TIMEOUT_S")
+        if env_post_execution_timeout is not None:
+            try:
+                self.post_execution_timeout_s = float(env_post_execution_timeout)
+            except ValueError:
+                raise ValueError(
+                    "OPENSPACE_POST_EXECUTION_TIMEOUT_S must be a number"
+                ) from None
+        self.post_execution_timeout_s = max(
+            0.0,
+            float(self.post_execution_timeout_s or 0.0),
+        )
+        env_max_result_size = os.environ.get("OPENSPACE_DEFAULT_MAX_RESULT_SIZE_CHARS")
+        if env_max_result_size is not None:
+            try:
+                self.max_result_size_chars = int(env_max_result_size)
+            except ValueError:
+                raise ValueError(
+                    "OPENSPACE_DEFAULT_MAX_RESULT_SIZE_CHARS must be an integer"
+                ) from None
+        if self.max_result_size_chars is not None:
+            self.max_result_size_chars = max(1, int(self.max_result_size_chars))
+        env_aggregate_tool_results = os.environ.get(
+            "OPENSPACE_MAX_TOOL_RESULTS_PER_MESSAGE_CHARS"
+        )
+        if env_aggregate_tool_results is not None:
+            try:
+                self.max_tool_results_per_message_chars = int(
+                    env_aggregate_tool_results
+                )
+            except ValueError:
+                raise ValueError(
+                    "OPENSPACE_MAX_TOOL_RESULTS_PER_MESSAGE_CHARS must be an integer"
+                ) from None
+        if self.max_tool_results_per_message_chars is not None:
+            self.max_tool_results_per_message_chars = max(
+                1,
+                int(self.max_tool_results_per_message_chars),
+            )
+
         self.evolution_storage_root = (
             self.evolution_storage_root
             or os.environ.get("OPENSPACE_EVOLUTION_STORAGE_ROOT")
@@ -227,6 +300,10 @@ class OpenSpaceConfig:
             "OPENSPACE_EVOLUTION_ENGINE_ENABLED",
             self.evolution_engine_enabled,
         )
+        self.evolution_allow_single_observation_capture = _env_bool(
+            "OPENSPACE_EVOLUTION_ALLOW_SINGLE_OBSERVATION_CAPTURE",
+            self.evolution_allow_single_observation_capture,
+        )
         env_evolution_mode = os.environ.get("OPENSPACE_EVOLUTION_MODE")
         if env_evolution_mode:
             self.evolution_mode = env_evolution_mode
@@ -246,6 +323,173 @@ class OpenSpaceConfig:
         self.evolution_candidate_recheck_drain_limit = max(
             0,
             int(self.evolution_candidate_recheck_drain_limit),
+        )
+        env_final_drain_limit = os.environ.get("OPENSPACE_EVOLUTION_FINAL_DRAIN_LIMIT")
+        if env_final_drain_limit is not None:
+            try:
+                self.evolution_final_drain_limit = int(env_final_drain_limit)
+            except ValueError:
+                raise ValueError(
+                    "OPENSPACE_EVOLUTION_FINAL_DRAIN_LIMIT must be an integer"
+                ) from None
+        self.evolution_final_drain_limit = max(
+            0,
+            int(self.evolution_final_drain_limit),
+        )
+        env_final_drain_rounds = os.environ.get("OPENSPACE_EVOLUTION_FINAL_DRAIN_ROUNDS")
+        if env_final_drain_rounds is not None:
+            try:
+                self.evolution_final_drain_rounds = int(env_final_drain_rounds)
+            except ValueError:
+                raise ValueError(
+                    "OPENSPACE_EVOLUTION_FINAL_DRAIN_ROUNDS must be an integer"
+                ) from None
+        self.evolution_final_drain_rounds = max(
+            0,
+            int(self.evolution_final_drain_rounds),
+        )
+        env_final_drain_timeout = os.environ.get(
+            "OPENSPACE_EVOLUTION_FINAL_DRAIN_TIMEOUT_S"
+        )
+        if env_final_drain_timeout is not None:
+            try:
+                self.evolution_final_drain_timeout_s = float(env_final_drain_timeout)
+            except ValueError:
+                raise ValueError(
+                    "OPENSPACE_EVOLUTION_FINAL_DRAIN_TIMEOUT_S must be a number"
+                ) from None
+        self.evolution_final_drain_timeout_s = max(
+            0.0,
+            float(self.evolution_final_drain_timeout_s),
+        )
+        env_startup_drain_limit = os.environ.get(
+            "OPENSPACE_EVOLUTION_STARTUP_RETRYABLE_DRAIN_LIMIT"
+        )
+        if env_startup_drain_limit is not None:
+            try:
+                self.evolution_startup_retryable_drain_limit = int(
+                    env_startup_drain_limit
+                )
+            except ValueError:
+                raise ValueError(
+                    "OPENSPACE_EVOLUTION_STARTUP_RETRYABLE_DRAIN_LIMIT "
+                    "must be an integer"
+                ) from None
+        self.evolution_startup_retryable_drain_limit = max(
+            0,
+            int(self.evolution_startup_retryable_drain_limit),
+        )
+        env_startup_drain_rounds = os.environ.get(
+            "OPENSPACE_EVOLUTION_STARTUP_RETRYABLE_DRAIN_ROUNDS"
+        )
+        if env_startup_drain_rounds is not None:
+            try:
+                self.evolution_startup_retryable_drain_rounds = int(
+                    env_startup_drain_rounds
+                )
+            except ValueError:
+                raise ValueError(
+                    "OPENSPACE_EVOLUTION_STARTUP_RETRYABLE_DRAIN_ROUNDS "
+                    "must be an integer"
+                ) from None
+        self.evolution_startup_retryable_drain_rounds = max(
+            0,
+            int(self.evolution_startup_retryable_drain_rounds),
+        )
+        env_startup_drain_timeout = os.environ.get(
+            "OPENSPACE_EVOLUTION_STARTUP_RETRYABLE_DRAIN_TIMEOUT_S"
+        )
+        if env_startup_drain_timeout is not None:
+            try:
+                self.evolution_startup_retryable_drain_timeout_s = float(
+                    env_startup_drain_timeout
+                )
+            except ValueError:
+                raise ValueError(
+                    "OPENSPACE_EVOLUTION_STARTUP_RETRYABLE_DRAIN_TIMEOUT_S "
+                    "must be a number"
+                ) from None
+        self.evolution_startup_retryable_drain_timeout_s = max(
+            0.0,
+            float(self.evolution_startup_retryable_drain_timeout_s),
+        )
+        env_startup_drain_statuses = os.environ.get(
+            "OPENSPACE_EVOLUTION_STARTUP_RETRYABLE_DRAIN_STATUSES"
+        )
+        if env_startup_drain_statuses is not None:
+            self.evolution_startup_retryable_drain_statuses = (
+                env_startup_drain_statuses
+            )
+        statuses = [
+            item.strip()
+            for item in str(self.evolution_startup_retryable_drain_statuses).split(",")
+            if item.strip()
+        ]
+        self.evolution_startup_retryable_drain_statuses = (
+            ",".join(dict.fromkeys(statuses)) or "failed_retryable"
+        )
+        env_recovery_stale_timeout = os.environ.get(
+            "OPENSPACE_EVOLUTION_RECOVERY_STALE_JOB_TIMEOUT_S"
+        )
+        if env_recovery_stale_timeout is not None:
+            try:
+                self.evolution_recovery_stale_job_timeout_s = float(
+                    env_recovery_stale_timeout
+                )
+            except ValueError:
+                raise ValueError(
+                    "OPENSPACE_EVOLUTION_RECOVERY_STALE_JOB_TIMEOUT_S "
+                    "must be a number"
+                ) from None
+        self.evolution_recovery_stale_job_timeout_s = max(
+            0.0,
+            float(self.evolution_recovery_stale_job_timeout_s),
+        )
+        env_behavior_revisions = os.environ.get(
+            "OPENSPACE_EVOLUTION_BEHAVIOR_EVAL_MAX_REVISIONS"
+        )
+        if env_behavior_revisions is not None:
+            try:
+                self.evolution_behavior_eval_max_revisions = int(env_behavior_revisions)
+            except ValueError:
+                raise ValueError(
+                    "OPENSPACE_EVOLUTION_BEHAVIOR_EVAL_MAX_REVISIONS must be an integer"
+                ) from None
+        self.evolution_behavior_eval_max_revisions = max(
+            0,
+            int(self.evolution_behavior_eval_max_revisions),
+        )
+        self.evolution_behavior_eval_require_replay_runner = _env_bool(
+            "OPENSPACE_EVOLUTION_BEHAVIOR_EVAL_REQUIRE_REPLAY_RUNNER",
+            self.evolution_behavior_eval_require_replay_runner,
+        )
+        self.evolution_routing_eval_enabled = _env_bool(
+            "OPENSPACE_EVOLUTION_ROUTING_EVAL_ENABLED",
+            self.evolution_routing_eval_enabled,
+        )
+        self.evolution_routing_eval_required = _env_bool(
+            "OPENSPACE_EVOLUTION_ROUTING_EVAL_REQUIRED",
+            self.evolution_routing_eval_required,
+        )
+        self.evolution_replay_command = (
+            self.evolution_replay_command
+            or os.environ.get("OPENSPACE_EVOLUTION_REPLAY_COMMAND")
+        )
+        self.evolution_replay_docker_image = (
+            self.evolution_replay_docker_image
+            or os.environ.get("OPENSPACE_EVOLUTION_REPLAY_DOCKER_IMAGE")
+        )
+        env_replay_timeout = os.environ.get("OPENSPACE_EVOLUTION_REPLAY_TIMEOUT_S")
+        if env_replay_timeout is not None:
+            try:
+                self.evolution_replay_timeout_s = float(env_replay_timeout)
+            except ValueError:
+                raise ValueError(
+                    "OPENSPACE_EVOLUTION_REPLAY_TIMEOUT_S must be a number"
+                ) from None
+        self.evolution_replay_timeout_s = max(
+            1.0,
+            float(self.evolution_replay_timeout_s),
         )
         if not self.llm_model:
             raise ValueError("llm_model is required")

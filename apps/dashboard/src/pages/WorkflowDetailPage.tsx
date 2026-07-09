@@ -496,6 +496,7 @@ export default function WorkflowDetailPage() {
   const statusLabel = humanizeToken(workflow.status || 'unknown');
   const selectionMethodLabel = selectionMethod ? humanizeToken(selectionMethod) : t('workflowDetail.notRecorded');
   const successRateLabel = formatPercent(workflow.success_rate);
+  const traceEventCount = workflow.trace?.summary.total_events ?? 0;
 
   return (
     <div className="workflow-detail-page p-6">
@@ -509,6 +510,12 @@ export default function WorkflowDetailPage() {
                   className="workflow-chip text-sm transition-colors hover:border-[color:var(--color-border-dark)] hover:text-ink"
                 >
                   {t('workflowDetail.backToWorkflows')}
+                </Link>
+                <Link
+                  to={`/workflows/${encodeURIComponent(workflow.id)}/trace`}
+                  className="workflow-chip text-sm transition-colors hover:border-[color:var(--color-border-dark)] hover:text-ink"
+                >
+                  {t('workflowDetail.openAgentTrace')}
                 </Link>
                 <WorkflowChip className={getStatusChipClasses(workflow.status)}>{statusLabel}</WorkflowChip>
                 <WorkflowChip>{selectedSkillLabel}</WorkflowChip>
@@ -572,6 +579,11 @@ export default function WorkflowDetailPage() {
               label={t('workflowDetail.timelineEvents')}
               value={timelineSummary.total}
               hint={t('workflowDetail.agentToolHint', { agentCount: agentActionCount, toolCount: toolExecutionCount })}
+            />
+            <SummaryMetric
+              label={t('workflowDetail.traceEvents')}
+              value={traceEventCount}
+              hint={t('workflowDetail.traceEventsHint', { count: Object.keys(workflow.trace?.summary.harness_counts ?? {}).length })}
             />
           </section>
         </section>

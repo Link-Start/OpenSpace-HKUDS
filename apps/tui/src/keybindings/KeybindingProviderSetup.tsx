@@ -34,6 +34,7 @@ const RAW_TERMINAL_KEY_ACTIONS: Partial<Record<RawTerminalKeyName, string>> = {
   wheelup: "scroll:wheelUp",
   wheeldown: "scroll:wheelDown",
 };
+const PLAIN_INPUT_KEY = {} as Key;
 
 type Props = {
   children: React.ReactNode;
@@ -121,6 +122,31 @@ function isContextActive(
   return context === "Global" || activeContexts.has(context);
 }
 
+function splitLeadingControlInput(input: string): {
+  input: string;
+  key: Key;
+  rest: string;
+} | null {
+  if (input.length <= 1) {
+    return null;
+  }
+
+  const code = input.charCodeAt(0);
+  if (code < 1 || code > 26) {
+    return null;
+  }
+
+  return {
+    input: String.fromCharCode(code + 96),
+    key: { ctrl: true } as Key,
+    rest: input.slice(1),
+  };
+}
+
+function isPlainTextInput(input: string, key: Key): boolean {
+  return input.length > 0 && !key.ctrl && !key.meta;
+}
+
 function KeybindingInputRouter({
   bindings,
   pendingChordRef,
@@ -154,6 +180,37 @@ function KeybindingInputRouter({
       handlerRegistryRef.current,
       inputRegistryRef.current,
     );
+    const leadingControlInput = splitLeadingControlInput(input);
+    if (leadingControlInput) {
+      const result = resolveKeyWithChordState(
+        leadingControlInput.input,
+        leadingControlInput.key,
+        contexts,
+        bindings,
+        pendingChordRef.current,
+      );
+
+      if (result.type === "match") {
+        setPendingChord(null);
+        if (invokeAction(result.action, contexts)) {
+          if (
+            result.action === "app:toggleTranscript" &&
+            leadingControlInput.rest.length > 0
+          ) {
+            setTimeout(() => {
+              const nextContexts = collectContexts(
+                activeContextsRef.current,
+                handlerRegistryRef.current,
+                inputRegistryRef.current,
+              );
+              dispatchInput(leadingControlInput.rest, PLAIN_INPUT_KEY, nextContexts);
+            }, 0);
+          }
+          return;
+        }
+      }
+    }
+
     const rawTerminalKeyNames = getRawTerminalKeyNames(input);
     if (rawTerminalKeyNames.length > 1) {
       setPendingChord(null);
@@ -190,8 +247,13 @@ function KeybindingInputRouter({
         }
         break;
       case "chord_cancelled":
+        setPendingChord(null);
+        return;
       case "unbound":
         setPendingChord(null);
+        if (isPlainTextInput(input, key)) {
+          dispatchInput(input, key, contexts);
+        }
         return;
       case "none":
       default:
@@ -326,8 +388,9 @@ export function KeybindingSetup({ children }: Props): React.ReactElement {
             continue;
           }
 
-          registration.handler(input, key);
-          return true;
+          if (registration.handler(input, key) !== false) {
+            return true;
+          }
         }
       }
 

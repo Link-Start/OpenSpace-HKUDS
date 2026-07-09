@@ -362,6 +362,10 @@ async def tui_mode(
                 )
             return
 
+        if event_type == "status_update":
+            await bridge.send(CoreToTuiEvent.STATUS_UPDATE.value, payload)
+            return
+
         if event_type == "background_session_update":
             metadata = payload.get("metadata", {})
             if not isinstance(metadata, dict):
@@ -565,6 +569,14 @@ async def tui_mode(
                 continue
 
             if event.type == "resume_session":
+                if current_query_task is not None and not current_query_task.done():
+                    await _send_bridge_notification(
+                        bridge,
+                        "warn",
+                        "Busy",
+                        "Wait for the active query to finish before changing sessions",
+                    )
+                    continue
                 resumed = await handle_resume_event(openspace, bridge, event.data)
                 if resumed is not None:
                     active_session_id = resumed

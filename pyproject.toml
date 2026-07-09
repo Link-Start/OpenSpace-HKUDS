@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "openspace"
-version = "0.1.0"
+version = "2.0.0"
 description = "OpenSpace"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -29,6 +29,7 @@ dependencies = [
     "pydantic>=2.12.0",
     "aiohttp>=3.10.0",
     "requests>=2.32.0",
+    "websockets>=13.0",
 ]
 
 [project.optional-dependencies]
@@ -104,7 +105,6 @@ openspace = [
     "protocol/schema/*.json",
     "skills/*/.skill_id",
     "skills/*/SKILL.md",
-    "skills/README.md",
     "packaged/tui/**/*",
     "packaged/dashboard/**/*",
 ]

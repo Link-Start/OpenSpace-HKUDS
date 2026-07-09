@@ -3,6 +3,13 @@
 from .admission import AdmissionResult, EvolutionAdmission
 from .audit import EvidenceRefAccessError, EvolutionActionRecord, EvolutionAuditService
 from .authoring import AuthoringResult, SkillEvolverAuthoringBackend, StagedSkillEdit
+from .authoring_contract import (
+    AuthoringIntentSpec,
+    SkillAssertion,
+    SkillAuthoringContract,
+    SkillEvalPlan,
+    SkillReplayTask,
+)
 from .backfill import (
     BackfillResult,
     EvidenceBackfill,
@@ -11,7 +18,21 @@ from .backfill import (
     backfill_skill_store,
 )
 from .candidates import EvolutionCandidate, EvolutionCandidateStore
-from .engine import EvolutionCommitter, EvolutionEngine, EvolutionRunResult
+from .behavior_eval import (
+    ContractEvalResult,
+    ReplayEvalResult,
+    RoutingEvalResult,
+    SkillBehaviorEvalResult,
+    SkillBehaviorEvaluator,
+    SkillEvalAdapter,
+    SubprocessSkillReplayRunner,
+)
+from .engine import (
+    EvolutionCommitter,
+    EvolutionEngine,
+    EvolutionMutationOutcome,
+    EvolutionRunResult,
+)
 from .job_completion import (
     EvolutionJobCompletion,
     completion_after_recovery,
@@ -26,6 +47,7 @@ __all__ = [
     "AdmissionResult",
     "AuthoringResult",
     "BackfillResult",
+    "AuthoringIntentSpec",
     "EvidenceBackfill",
     "backfill_recording",
     "backfill_session",
@@ -33,11 +55,23 @@ __all__ = [
     "EvolutionActionRecord",
     "EvolutionAuditService",
     "EvidenceRefAccessError",
+    "ContractEvalResult",
+    "ReplayEvalResult",
+    "RoutingEvalResult",
+    "SkillAssertion",
+    "SkillAuthoringContract",
+    "SkillBehaviorEvalResult",
+    "SkillBehaviorEvaluator",
+    "SkillEvalAdapter",
+    "SubprocessSkillReplayRunner",
+    "SkillEvalPlan",
+    "SkillReplayTask",
     "EvolutionCandidate",
     "EvolutionCandidateStore",
     "EvolutionCommitter",
     "EvolutionAdmission",
     "EvolutionEngine",
+    "EvolutionMutationOutcome",
     "EvolutionJobCompletion",
     "EvolutionRecovery",
     "EvolutionRecoveryResult",

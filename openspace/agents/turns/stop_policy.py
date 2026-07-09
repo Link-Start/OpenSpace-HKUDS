@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import os
 from dataclasses import dataclass
 from typing import Any, Mapping
 
@@ -11,6 +12,7 @@ from openspace.llm.types import ModelResponse
 
 MAX_OUTPUT_TOKENS_RECOVERY_LIMIT: int = 3
 MAX_CONSECUTIVE_EMPTY: int = 5
+_MAX_OUTPUT_TOKENS_RECOVERY_LIMIT_ENV = "OPENSPACE_MAX_OUTPUT_TOKENS_RECOVERY_LIMIT"
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,17 +75,39 @@ def get_model_response_followup_messages(
 def build_max_output_tokens_recovery_message(
     attempt: int,
     *,
-    limit: int = MAX_OUTPUT_TOKENS_RECOVERY_LIMIT,
+    limit: int | None = None,
 ) -> dict[str, Any]:
+    resolved_limit = (
+        max_output_tokens_recovery_limit()
+        if limit is None
+        else max(0, int(limit))
+    )
     return {
         "role": "user",
         "content": (
             "Your response was truncated due to output length limits. "
-            "Please continue where you left off. "
-            f"(recovery attempt {attempt}/{limit})"
+            "Do not continue the long response verbatim. Keep your next chat "
+            "message minimal. Your next response must contain a tool call "
+            "when tools are available. Call a shell/file tool now to inspect "
+            "files, write the best current artifact to the requested path, or "
+            "run a verification command. Put substantial code, data, and "
+            "analysis into files or commands instead of chat. "
+            f"(recovery attempt {attempt}/{resolved_limit})"
         ),
-        "_meta": {"type": "max_output_tokens_recovery"},
+        "_meta": {"type": "max_output_tokens_recovery", "is_meta": True},
     }
+
+
+def max_output_tokens_recovery_limit(
+    default: int = MAX_OUTPUT_TOKENS_RECOVERY_LIMIT,
+) -> int:
+    raw = os.environ.get(_MAX_OUTPUT_TOKENS_RECOVERY_LIMIT_ENV)
+    if raw is None:
+        return default
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return default
 
 
 def should_recover_max_output_tokens(
@@ -91,12 +115,17 @@ def should_recover_max_output_tokens(
     stop_reason: str | None,
     has_tool_calls: bool,
     recovery_count: int,
-    limit: int = MAX_OUTPUT_TOKENS_RECOVERY_LIMIT,
+    limit: int | None = None,
 ) -> bool:
+    resolved_limit = (
+        max_output_tokens_recovery_limit()
+        if limit is None
+        else max(0, int(limit))
+    )
     return (
         stop_reason == "length"
         and not has_tool_calls
-        and recovery_count < limit
+        and recovery_count < resolved_limit
     )
 
 
@@ -179,6 +208,7 @@ __all__ = [
     "is_abort_requested",
     "is_api_error_message",
     "is_tool_call_only_response",
+    "max_output_tokens_recovery_limit",
     "max_iterations_stop_reason",
     "model_error_stop_reason",
     "should_recover_max_output_tokens",

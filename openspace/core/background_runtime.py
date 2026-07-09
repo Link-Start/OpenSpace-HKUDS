@@ -28,6 +28,7 @@ SUPPORTED_BACKGROUND_RUNTIME_EVENTS = RUNTIME_EVENT_TYPES | {
     "agent_list",
     "agent_event",
     "agent_transcript",
+    "status_update",
 }
 
 TASK_UPDATE_EVENT_STATUSES: dict[str, str] = {
@@ -196,6 +197,11 @@ class BackgroundRuntimeManager:
                 emit_agent_event=False,
                 emit_transcript=False,
             )
+            return self.snapshot()
+
+        if etype == "status_update":
+            event_payload.setdefault("session_id", self._session_id)
+            await self._emit("status_update", event_payload)
             return self.snapshot()
 
         if etype == "background_session_update":

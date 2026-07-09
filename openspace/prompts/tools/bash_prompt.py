@@ -54,7 +54,9 @@ def _background_usage_note() -> str | None:
         "the background. Only use this if you do not need the result "
         "immediately and are OK being notified when the command completes "
         "later. You do not need to use '&' at the end of the command when "
-        "using this parameter."
+        "using this parameter. If you need the output before continuing, use "
+        "a short follow-up bash command such as `cat <output_path>` or "
+        "`tail <output_path>` on the output file path returned by the tool."
     )
 
 
@@ -201,7 +203,7 @@ def get_simple_prompt() -> str:
         "Do not sleep between commands that can run immediately. Just run them.",
         "If your command is long running and you would like to be notified when it finishes, use `run_in_background`. No sleep needed.",
         "Do not retry failing commands in a sleep loop. Diagnose the root cause.",
-        "If waiting for a background task you started with `run_in_background`, you will be notified when it completes. Do not poll.",
+        "If a background task's result is needed for the next step, inspect the returned output file path with a short `cat` or `tail` command; do not use the read tool for session task output paths outside the workspace.",
         "If you must poll an external process, use a check command such as `gh run view` rather than sleeping first.",
         "If you must sleep, keep the duration short (1-5 seconds) to avoid blocking the user.",
     ]

@@ -152,7 +152,7 @@ function FullscreenLayoutBody({
         {messages}
         {afterMessages ? <Box flexDirection="column">{afterMessages}</Box> : null}
         {overlay ? (
-          <Box marginTop={1}>
+          <Box marginTop={1} width="100%" overflowX="hidden">
             <QueuedMessageProvider isFirst={true}>
               {overlay}
             </QueuedMessageProvider>

@@ -48,6 +48,7 @@ ignore local `.env` files; it cannot be enabled from `.env` itself.
 | `OPENSPACE_MAX_ITERATIONS` | Max agent iterations per task | `20` |
 | `OPENSPACE_BACKEND_SCOPE` | Enabled backends (comma-separated) | `shell,mcp,meta` |
 | `OPENSPACE_HOST_SKILL_DIRS` | Agent skill directories (comma-separated) | — |
+| `OPENSPACE_CAPTURE_SKILL_DIR` | Directory where CAPTURED evolution writes newly authored skills; falls back to the first host skill dir, then `<workspace>/.openspace/skills` | — |
 | `OPENSPACE_WORKSPACE` | Project root for logs/workspace | — |
 | `OPENSPACE_SHELL_CONDA_ENV` | Conda env for shell backend | — |
 
@@ -59,6 +60,18 @@ Provision cloud credentials with `openspace-cloud-auth bootstrap-agent-key --ema
 | `TAVILY_API_KEY` / `BRAVE_SEARCH_API_KEY` / `SERPAPI_API_KEY` | Optional fallback search provider keys | — |
 | `OPENSPACE_WEB_FETCH_MODEL` | Optional model override for applying prompts to fetched pages | — |
 | `OPENSPACE_ENABLE_RECORDING` | Record execution traces | `true` |
+| `OPENSPACE_MAX_OUTPUT_TOKENS_RECOVERY_LIMIT` | Number of no-tool max-output recovery nudges before stopping a turn | `3` |
+| `OPENSPACE_FORCE_TOOL_ON_MAX_OUTPUT_RECOVERY` | Force `tool_choice=required` on max-output recovery calls when tools are available | `false` |
+| `OPENSPACE_DISABLE_REASONING_ON_REQUIRED_TOOL_CHOICE` | Suppress provider reasoning controls only on required-tool calls | `false` |
+| `OPENSPACE_OPENROUTER_DISABLE_REASONING_ON_REQUIRED_TOOL_CHOICE` | OpenRouter-specific version of required-tool reasoning suppression | `false` |
+| `OPENSPACE_BENCH_FINALIZE_NUDGE_ENABLED` | Enable a benchmark-only best-artifact finalization nudge during long single-task runs | `false` |
+| `OPENSPACE_BENCH_FINALIZE_NUDGE_AFTER_SEC` | Seconds before the benchmark finalization nudge may be injected; `0` disables time-based triggering | `0` |
+| `OPENSPACE_BENCH_FINALIZE_NUDGE_AFTER_ITERATION` | Model iteration before the benchmark finalization nudge may be injected; `0` disables iteration-based triggering | `0` |
+| `OPENSPACE_BENCH_FINALIZE_NUDGE_MAX` | Maximum benchmark finalization nudges per turn | `1` |
+| `OPENSPACE_BENCH_FINALIZE_STOP_AFTER_ITERATIONS` | Stop a benchmark turn this many iterations after a finalization nudge so external verifiers can score the best artifact; `0` disables | `0` |
+| `OPENSPACE_BENCH_FINALIZE_STOP_AFTER_SEC` | Stop a benchmark turn this many seconds after a finalization nudge; `0` disables | `0` |
+| `OPENSPACE_BENCH_STRICT_NO_TOOL_FINAL` | After a benchmark finalization nudge, require a later tool action before accepting a no-tool final response; retry with the configured fallback model when available | `false` |
+| `OPENSPACE_BENCH_NO_TOOL_FINAL_MAX_NUDGES` | Number of tool-backed finalization nudges before switching to fallback model or stopping as unresolved | `2` |
 | `OPENSPACE_EVOLUTION_STORAGE_ROOT` | Root used to resolve `.openspace/openspace.db`, `.openspace/evidence.db`, staging, and backups | workspace |
 | `OPENSPACE_SKILL_STORE_DB_PATH` | Explicit SkillStore SQLite path; also anchors the evolution storage root when no storage root is set | — |
 | `OPENSPACE_EVOLUTION_EVIDENCE_DB_PATH` | Explicit evidence SQLite path; takes precedence over storage-root resolution for evidence | — |
@@ -66,7 +79,36 @@ Provision cloud credentials with `openspace-cloud-auth bootstrap-agent-key --ema
 | `OPENSPACE_EVOLUTION_TRIGGERS_ENABLED` | Enable durable TriggerJob creation from evidence checkpoints; set `false` to keep evidence ingest but pause trigger jobs | `true` |
 | `OPENSPACE_EVOLUTION_ENGINE_ENABLED` | Enable TriggerJob processing through decision, admission, staged authoring, validation, and commit | `true` |
 | `OPENSPACE_EVOLUTION_MODE` | Evolution mode: `audit_only` audits only, `fix_only` commits explicit direct FIX only, `autonomous` allows all validated admitted actions | `autonomous` |
+| `OPENSPACE_EVOLUTION_ALLOW_SINGLE_OBSERVATION_CAPTURE` | Allow successful non-trivial CAPTURED proposals from one execution to proceed directly instead of waiting for recurrence; useful for controlled benchmark warmup runs | `false` |
+| `OPENSPACE_EVOLUTION_FINAL_DRAIN_LIMIT` | Number of open post-execution evolution jobs to retry before a short-lived runtime exits; `0` disables the extra drain | `0` |
+
+## 3. Task Runtime Context Defaults
+
+These are `OpenSpaceConfig` / JSON config fields rather than environment
+variables. They are useful for benchmark adapters that need a narrower
+task-solving surface while keeping normal interactive OpenSpace defaults
+unchanged.
+
+| Field | Description | Default |
+|-------|-------------|---------|
+| `active_tool_names` | Optional hard allowlist of tool names exposed to the agent for a turn | — |
+| `capture_skill_dir` | Directory where post-execution CAPTURED skills should be staged and committed for this runtime | — |
+| `policy_deferred_tool_names` | Optional tool names kept behind `tool_search`; use `[]` to avoid deferred-tool discovery | — |
+| `skills_disabled` | Hide Skill Protocol tools and skill prompt guidance from the task-solving agent | `false` |
+| `memory_mode` | Optional memory mode override for the task context | — |
+| `OPENSPACE_EVOLUTION_FINAL_DRAIN_ROUNDS` | Maximum final-drain rounds to run | `1` |
+| `OPENSPACE_EVOLUTION_FINAL_DRAIN_TIMEOUT_S` | Per-round timeout for the final evolution drain; `0` disables the timeout wrapper | `0` |
+| `OPENSPACE_EVOLUTION_STARTUP_RETRYABLE_DRAIN_LIMIT` | Number of persisted `failed_retryable` evolution jobs to explicitly retry during startup after stale-job recovery; `0` disables startup retryable drain | `0` |
+| `OPENSPACE_EVOLUTION_STARTUP_RETRYABLE_DRAIN_ROUNDS` | Maximum startup retryable-drain rounds to run | `1` |
+| `OPENSPACE_EVOLUTION_STARTUP_RETRYABLE_DRAIN_TIMEOUT_S` | Per-round timeout for startup retryable drain; `0` disables the timeout wrapper | `0` |
+| `OPENSPACE_EVOLUTION_STARTUP_RETRYABLE_DRAIN_STATUSES` | Comma-separated TriggerJob statuses eligible for startup drain, useful for controlled replay runs that should continue copied `pending` jobs | `failed_retryable` |
+| `OPENSPACE_EVOLUTION_RECOVERY_STALE_JOB_TIMEOUT_S` | Age in seconds before startup recovery resets a `running` TriggerJob to retryable/failed; lower it when intentionally replaying a freshly interrupted evidence DB | `1800` |
+| `OPENSPACE_EVOLUTION_BEHAVIOR_EVAL_REQUIRE_REPLAY_RUNNER` | Require an external replay runner before behavior eval can approve replay-backed skill changes. Keep enabled for strict autonomous evolution; set `false` in harnesses that only have deterministic/routing eval available | `true` |
+| `OPENSPACE_POST_EXECUTION_TIMEOUT_S` | Hard timeout for inline/background post-execution analysis and evolution drain; `0` disables the timeout. If a claimed evolution job is cancelled by this timeout, it is marked retryable instead of being left `running` | `0` |
 | `OPENSPACE_EVOLUTION_ALLOWED_READ_ROOTS` | Extra evidence file-read roots, separated by the platform path separator | — |
+| `OPENSPACE_DEFAULT_MAX_RESULT_SIZE_CHARS` | Per-tool result size threshold before persisting large outputs to disk | `50000` |
+| `OPENSPACE_MAX_TOOL_RESULTS_PER_MESSAGE_CHARS` | Aggregate tool-result text budget kept in the model conversation before replacing large old results with persisted-output previews | `200000` |
+| `OPENSPACE_TOOL_RESULT_PREVIEW_CHARS` | Preview size included in persisted-output wrappers | `2000` |
 | `OPENSPACE_LOG_LEVEL` | Log level | `INFO` |
 
 ## 3. User Settings (`settings.json`)

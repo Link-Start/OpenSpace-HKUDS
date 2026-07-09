@@ -37,8 +37,87 @@ function isTerminalRuntimePhase(phase: string | undefined): boolean {
     phase === "query_cancelled" ||
     phase === "query_error" ||
     phase === "completed" ||
+    phase === "complete" ||
+    phase === "success" ||
+    phase === "succeeded" ||
     phase === "error" ||
     phase === "cancelled"
+  );
+}
+
+function taskStatusForRuntimePhase(
+  phase: string | undefined,
+  currentStatus: TaskState["status"] | undefined,
+): TaskState["status"] {
+  switch (phase) {
+    case "execution_start":
+      return "running";
+    case "query_complete":
+    case "completed":
+    case "complete":
+    case "success":
+    case "succeeded":
+      return "success";
+    case "query_cancelled":
+    case "cancelled":
+      return "cancelled";
+    case "query_error":
+    case "error":
+      return "error";
+    default:
+      return currentStatus ?? "running";
+  }
+}
+
+function displayPhaseForRuntimePhase(
+  phase: string | undefined,
+  currentPhase: string | undefined,
+): string | undefined {
+  switch (phase) {
+    case "query_complete":
+    case "query_cancelled":
+    case "completed":
+    case "complete":
+    case "success":
+    case "succeeded":
+    case "cancelled":
+      return "idle";
+    case "query_error":
+      return "error";
+    default:
+      return phase ?? currentPhase;
+  }
+}
+
+function keepIdleForLateRuntimePhase(
+  phase: string | undefined,
+  currentPhase: string | undefined,
+  isQuerying: boolean,
+): boolean {
+  if (isQuerying || currentPhase !== "idle" || !phase) {
+    return false;
+  }
+  if (isTerminalRuntimePhase(phase)) {
+    return false;
+  }
+
+  const normalized = phase.toLowerCase();
+  return ![
+    "execution_start",
+    "running",
+    "running execution",
+    "compact_start",
+  ].includes(normalized);
+}
+
+function isStaleSessionEvent(
+  currentSessionId: string | undefined,
+  eventSessionId: string | undefined,
+): boolean {
+  return Boolean(
+    currentSessionId &&
+      eventSessionId &&
+      currentSessionId !== eventSessionId,
   );
 }
 
@@ -54,14 +133,18 @@ export function useRuntimeTasks(): {
   const applyStatusUpdate = React.useCallback(
     (data: StatusUpdateData) => {
       setAppState(prev => {
+        if (isStaleSessionEvent(prev.runtime.sessionId, data.session_id)) {
+          return prev;
+        }
+
         const taskId = data.task_id ?? prev.runtime.activeTaskId;
         const nextTasks =
           taskId !== undefined
             ? upsertTask(prev.tasks, taskId, {
-                status:
-                  data.phase === "execution_start"
-                    ? "running"
-                    : (prev.tasks[taskId]?.status ?? "running"),
+                status: taskStatusForRuntimePhase(
+                  data.phase,
+                  prev.tasks[taskId]?.status,
+                ),
                 phase: data.phase ?? prev.tasks[taskId]?.phase,
                 maxIterations:
                   data.max_iterations ?? prev.tasks[taskId]?.maxIterations,
@@ -69,6 +152,13 @@ export function useRuntimeTasks(): {
                   data.total_iterations ?? prev.tasks[taskId]?.iterations,
               })
             : prev.tasks;
+        const nextPhase = keepIdleForLateRuntimePhase(
+          data.phase,
+          prev.runtime.phase,
+          prev.isQuerying,
+        )
+          ? prev.runtime.phase
+          : displayPhaseForRuntimePhase(data.phase, prev.runtime.phase);
 
         return {
           ...prev,
@@ -84,7 +174,7 @@ export function useRuntimeTasks(): {
             costUsd: data.cost_usd ?? prev.runtime.costUsd,
             inputTokens: data.input_tokens ?? prev.runtime.inputTokens,
             outputTokens: data.output_tokens ?? prev.runtime.outputTokens,
-            phase: data.phase ?? prev.runtime.phase,
+            phase: nextPhase,
             activeTaskId: taskId ?? prev.runtime.activeTaskId,
             maxIterations:
               data.max_iterations ?? prev.runtime.maxIterations,

@@ -133,12 +133,14 @@ class TriggerEngine:
         worker_id: str | None = None,
         trigger_types: tuple[str, ...] | None = None,
         scope: EvidenceScope | None = None,
+        claim_statuses: tuple[str, ...] | None = None,
     ) -> list[TriggerJob]:
         return self.store.claim_next(
             limit=limit,
             worker_id=worker_id,
             trigger_types=trigger_types,
             scope=scope,
+            claim_statuses=claim_statuses,
         )
 
     def claim_jobs(

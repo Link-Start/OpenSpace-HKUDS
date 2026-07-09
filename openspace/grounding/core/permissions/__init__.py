@@ -48,6 +48,7 @@ from .filesystem import (
     all_working_directories,
     path_in_working_path,
     path_in_allowed_working_path,
+    register_internal_path_predicate,
     DANGEROUS_FILES,
     DANGEROUS_DIRECTORIES,
 )
@@ -171,6 +172,7 @@ __all__ = [
     "all_working_directories",
     "path_in_working_path",
     "path_in_allowed_working_path",
+    "register_internal_path_predicate",
     "DANGEROUS_FILES",
     "DANGEROUS_DIRECTORIES",
     # --- Bash ---

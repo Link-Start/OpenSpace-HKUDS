@@ -43,7 +43,19 @@ class AnalyzerDecisionAdapter:
         source_analysis_id: str | None = None,
     ) -> list[DecisionRationale]:
         if not analysis.evolution_suggestions:
-            return []
+            fallback = _fallback_capture_suggestion(analysis, packet)
+            if fallback is None:
+                return []
+            return [
+                self._captured_decision(
+                    analysis,
+                    packet,
+                    fallback,
+                    index=0,
+                    source_analysis_id=source_analysis_id,
+                    extra_reason_tags=["fallback_no_evolution_suggestion"],
+                )
+            ]
 
         decisions: list[DecisionRationale] = []
         for index, suggestion in enumerate(analysis.evolution_suggestions):
@@ -229,6 +241,7 @@ class AnalyzerDecisionAdapter:
         *,
         index: int,
         source_analysis_id: str | None,
+        extra_reason_tags: list[str] | None = None,
     ) -> DecisionRationale:
         if not _task_completed(analysis, packet):
             return _noop_from_suggestion(
@@ -281,6 +294,7 @@ class AnalyzerDecisionAdapter:
                 "analyzer_adapter",
                 "captured",
                 "candidate_default",
+                *(extra_reason_tags or []),
                 *_quality_signal_reason_tags(packet),
             ],
             evidence_claims=claims,
@@ -297,24 +311,33 @@ def packet_conflicts_with_analysis(
     """Return conflicts where packet facts should dominate analyzer proposals."""
 
     risks: list[str] = []
-    packet_completed = _packet_indicates_completed(packet)
-    note = str(analysis.execution_note or "").lower()
-    says_final_missing = any(
-        phrase in note
-        for phrase in (
-            "final answer missing",
-            "missing final answer",
-            "no final answer",
-            "final response missing",
-            "did not provide a final",
-        )
-    )
-    if packet_completed and (not analysis.task_completed or says_final_missing):
-        risks.append(
-            "analyzer proposal conflicts with packet completion evidence: "
-            "runtime status/final transcript indicate completion"
-        )
+    # Packet completion is the runtime fact.  The adapter below already treats
+    # ``analysis.task_completed or packet_completed`` as sufficient for captured
+    # decisions, so an analyzer false-negative about completion should not
+    # discard otherwise usable evolution suggestions.
+    if _packet_indicates_completed(packet):
+        return risks
     return risks
+
+
+def _fallback_capture_suggestion(
+    analysis: ExecutionAnalysis,
+    packet: EvidencePacket,
+) -> EvolutionSuggestion | None:
+    if not _task_completed(analysis, packet):
+        return None
+    if not _primary_capture_ref_ids(packet):
+        return None
+
+    return EvolutionSuggestion(
+        evolution_type=EvolutionType.CAPTURED,
+        direction=(
+            "Capture any reusable workflow pattern from the completed task. "
+            "The analyzer produced no explicit evolution suggestion, but the "
+            "runtime packet contains completion evidence and primary workflow "
+            "refs for admission review."
+        ),
+    )
 
 
 def _decision(

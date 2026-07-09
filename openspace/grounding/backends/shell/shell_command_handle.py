@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import signal
+import shutil
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -78,15 +79,29 @@ class BackgroundShellHandle:
             )
         else:
             final_command = _wrap_script_with_conda(command, conda_env)
-            process = await asyncio.create_subprocess_shell(
-                final_command,
-                stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-                cwd=cwd or None,
-                env=merged_env,
-                start_new_session=True,
-            )
+            bash_path = shutil.which("bash", path=merged_env.get("PATH"))
+            if bash_path:
+                process = await asyncio.create_subprocess_exec(
+                    bash_path,
+                    "-lc",
+                    final_command,
+                    stdin=asyncio.subprocess.DEVNULL,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                    cwd=cwd or None,
+                    env=merged_env,
+                    start_new_session=True,
+                )
+            else:
+                process = await asyncio.create_subprocess_shell(
+                    final_command,
+                    stdin=asyncio.subprocess.DEVNULL,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                    cwd=cwd or None,
+                    env=merged_env,
+                    start_new_session=True,
+                )
         assert process.stdout is not None
         drain_task = asyncio.create_task(cls._drain_stream(process.stdout, path))
         handle = cls(

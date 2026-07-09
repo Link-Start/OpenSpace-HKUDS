@@ -26,5 +26,9 @@ export type {
   WorkflowArtifact,
   WorkflowDetail,
   WorkflowSummary,
+  WorkflowTrace,
+  WorkflowTraceDatum,
+  WorkflowTraceEvent,
+  WorkflowTraceSummary,
   WorkflowTimelineEvent,
 } from './types';

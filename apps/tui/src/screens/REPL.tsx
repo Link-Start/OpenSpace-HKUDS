@@ -166,21 +166,23 @@ import {
 import { formatStructuredValueForDisplay } from "../utils/structuredDisplay.js";
 import { hasForegroundBackgroundTasks } from "../utils/backgroundTasks.js";
 import { copyTextToClipboard } from "../utils/clipboard.js";
+import { estimateWrappedRows } from "../utils/textWidth.js";
 
 type Props = {
   io: StructuredIO | null;
   initialMessages?: AppMessage[];
   initialSessionId?: string;
-  initialCost?: number;
+  initialCost?: number | null;
   initialSessionContext?: {
     sessionId?: string;
-    cost?: number;
+    cost?: number | null;
     messages?: AppMessage[];
     context?: SessionContextState | null;
   };
 };
 
 const STREAMING_FLUSH_INTERVAL_MS = 80;
+const MAX_PROMPT_INPUT_ROWS = 4;
 
 function writeLayoutDebug(payload: Record<string, unknown>): void {
   const target = process.env.OPENSPACE_TUI_LAYOUT_DEBUG;
@@ -230,12 +232,67 @@ type TranscriptSelectionState = {
 
 type TranscriptMutationState = "idle" | "rewind" | "restore";
 
+const BUSY_ALLOWED_CORE_SLASH_COMMANDS = new Set(["cost", "effort"]);
+const REWINDABLE_MESSAGE_ROLES = new Set<AppMessage["role"]>([
+  "system",
+  "user",
+  "assistant",
+  "tool",
+]);
+
 function clampMessageIndex(index: number, total: number): number {
   if (total <= 0) {
     return 0;
   }
 
   return Math.max(0, Math.min(total - 1, index));
+}
+
+function applyInputChunkBeforeSubmit(
+  value: string,
+  cursorOffset: number,
+  rawInput: string,
+): string | null {
+  const submitIndex = rawInput.indexOf("\r");
+  if (submitIndex < 0) {
+    return null;
+  }
+
+  const beforeSubmit = Array.from(rawInput.slice(0, submitIndex))
+    .filter(char => char >= " " && char !== "\u007f")
+    .join("");
+  const boundedOffset = Math.max(0, Math.min(value.length, cursorOffset));
+  return `${value.slice(0, boundedOffset)}${beforeSubmit}${value.slice(boundedOffset)}`;
+}
+
+function normalizeRestoredRuntimePhase(
+  phase: string | undefined,
+): string | undefined {
+  switch (phase) {
+    case "query_complete":
+    case "query_cancelled":
+    case "completed":
+    case "complete":
+    case "success":
+    case "succeeded":
+    case "cancelled":
+      return "idle";
+    case "query_error":
+      return "error";
+    default:
+      return phase;
+  }
+}
+
+function isStaleSessionEvent(
+  currentSessionId: string | undefined,
+  eventSessionId: string | undefined,
+): boolean {
+  return Boolean(
+    currentSessionId &&
+      eventSessionId &&
+      currentSessionId !== eventSessionId,
+  );
 }
 
 function cycleAgentPanelTab(
@@ -262,7 +319,25 @@ function summarizeToolInput(input: Record<string, unknown> | undefined): string 
 
 function summarizeToolResult(result: unknown): string {
   const rendered = stringifyUnknown(result);
+  if (typeof rendered !== "string" || rendered.trim().length === 0) {
+    return "No result";
+  }
   return truncate(rendered.replace(/\s+/g, " ").trim(), 160);
+}
+
+function summarizeToolComplete(data: ToolCompleteData): string {
+  if (data.result !== undefined) {
+    return summarizeToolResult(data.result);
+  }
+  const status =
+    typeof data.status === "string" && data.status.trim().length > 0
+      ? data.status.trim()
+      : "complete";
+  const size =
+    typeof data.result_size_chars === "number"
+      ? ` (${data.result_size_chars} chars)`
+      : "";
+  return `${status}${size}`;
 }
 
 function updateToolUseMessage(
@@ -541,6 +616,10 @@ const RUNTIME_ACTIVITY_EVENTS = new Set([
   "dynamic_skills_consumed",
   "skill_discovery_prefetch_consumed",
   "cost_summary",
+  "side_query_start",
+  "side_query_complete",
+  "side_query_cancelled",
+  "side_query_error",
   "llm_retry",
   "memory_extraction_skipped",
   "memory_extraction_coalesced",
@@ -553,6 +632,8 @@ const RUNTIME_ACTIVITY_EVENTS = new Set([
   "session_memory_compact",
   "session_memory_compact_skipped",
   "session_memory_compact_resumed_session",
+  "session_memory_checked",
+  "session_memory_updated",
   "tool_cancelled",
   "tool_deferred_intercepted",
   "tool_executing",
@@ -572,7 +653,14 @@ const RUNTIME_ACTIVITY_EVENTS = new Set([
   "quality_signal_checkpoint_warning",
 ]);
 
+const QUIET_RUNTIME_ACTIVITY_EVENTS = new Set([
+  "memory_background_drain_timeout",
+  "background_housekeeping_drain_timeout",
+]);
+
 const BACKGROUND_TERMINAL_STATUSES = new Set([
+  "cancelled",
+  "canceled",
   "completed",
   "failed",
   "killed",
@@ -738,6 +826,10 @@ function shouldDisplayRuntimeActivity(
     return true;
   }
 
+  if (QUIET_RUNTIME_ACTIVITY_EVENTS.has(event)) {
+    return false;
+  }
+
   return (
     event.includes("error") ||
     event.includes("failed") ||
@@ -901,10 +993,16 @@ function backgroundTaskFromPayload(
     return null;
   }
 
-  const status =
+  const incomingStatus =
     getStringValue(payload, ["status", "state"]) ??
     current?.status ??
     "running";
+  const status =
+    current !== undefined &&
+    BACKGROUND_TERMINAL_STATUSES.has(current.status.toLowerCase()) &&
+    !BACKGROUND_TERMINAL_STATUSES.has(incomingStatus.toLowerCase())
+      ? current.status
+      : incomingStatus;
   const startedAt =
     getNumberValue(payload, ["start_time", "startedAt", "created_at"]) ??
     current?.startedAt ??
@@ -1020,6 +1118,21 @@ function applyAgentPayloadEvent(
     sessionId,
   );
 
+  const payloadTeamName = getStringValue(eventPayload, ["team_name", "teamName"]);
+  const payloadStatus = getStringValue(eventPayload, ["status", "state"]);
+  const updateCoordinator = (
+    patch: Partial<AgentRuntimeState["coordinator"]>,
+  ): void => {
+    next = {
+      ...next,
+      coordinator: {
+        ...next.coordinator,
+        ...patch,
+        updatedAt: timestamp,
+      },
+    };
+  };
+
   if (eventName === "agent_spawn" || eventName === "agent_task_update") {
     const task = backgroundTaskFromPayload(
       next.backgroundTasks[
@@ -1039,18 +1152,51 @@ function applyAgentPayloadEvent(
               [task.id]: task,
             },
     };
+    if (payloadTeamName || payloadStatus) {
+      const workers = Object.values(next.backgroundTasks).filter(taskState => {
+        const taskTeamName = taskState.teamName;
+        return (
+          !payloadTeamName ||
+          taskTeamName === undefined ||
+          taskTeamName === payloadTeamName
+        );
+      });
+      const runningWorkers = workers.filter(
+        taskState =>
+          !BACKGROUND_TERMINAL_STATUSES.has(taskState.status.toLowerCase()),
+      ).length;
+      updateCoordinator({
+        teamName: payloadTeamName ?? next.coordinator.teamName,
+        status: payloadStatus ?? next.coordinator.status,
+        runningWorkers,
+        totalWorkers: Math.max(next.coordinator.totalWorkers, workers.length),
+        message:
+          getStringValue(eventPayload, [
+            "summary",
+            "current_operation",
+            "currentOperation",
+          ]) ?? next.coordinator.message,
+      });
+    }
   } else if (eventName === "team_update") {
-    const teamName = getStringValue(eventPayload, ["team_name", "teamName"]);
+    const nextCoordinatorStatus =
+      getStringValue(eventPayload, ["status", "action"]) ??
+      next.coordinator.status;
+    const reportedRunningWorkers = getNumberValue(eventPayload, [
+      "running_workers",
+      "runningWorkers",
+    ]);
     next = {
       ...next,
       coordinator: {
-        teamName: teamName ?? next.coordinator.teamName,
-        status:
-          getStringValue(eventPayload, ["status", "action"]) ??
-          next.coordinator.status,
+        teamName: payloadTeamName ?? next.coordinator.teamName,
+        status: nextCoordinatorStatus,
         runningWorkers:
-          getNumberValue(eventPayload, ["running_workers", "runningWorkers"]) ??
-          next.coordinator.runningWorkers,
+          reportedRunningWorkers ??
+          (nextCoordinatorStatus !== undefined &&
+          BACKGROUND_TERMINAL_STATUSES.has(nextCoordinatorStatus.toLowerCase())
+            ? 0
+            : next.coordinator.runningWorkers),
         totalWorkers:
           getNumberValue(eventPayload, ["total_workers", "totalWorkers"]) ??
           next.coordinator.totalWorkers,
@@ -1134,15 +1280,12 @@ function formatPermissionResolution(resolution: PermissionResolution): string {
   }
 }
 
-function canResolveAllowAlways(request: PermissionRequestData): boolean {
-  return (
-    request.response_channel !== "tool_permission_response" ||
-    request.options?.some(option => option.option_id === "allow_always") === true
-  );
-}
-
 function isCopyableMessage(message: AppMessage): boolean {
   return message.meta?.hidden !== true && message.meta?.budget !== true;
+}
+
+function isRewindableMessage(message: AppMessage): boolean {
+  return isCopyableMessage(message) && REWINDABLE_MESSAGE_ROLES.has(message.role);
 }
 
 function extractSchemaFields(
@@ -1385,8 +1528,8 @@ export function REPL({
   >(null);
   const [viewMode, setViewMode] = React.useState<ReplViewMode>("prompt");
   const [showAllInTranscript, setShowAllInTranscript] = React.useState(false);
-  const [transcriptCursorIndex, setTranscriptCursorIndex] =
-    React.useState<number | null>(null);
+  const [transcriptCursorId, setTranscriptCursorId] =
+    React.useState<string | null>(null);
   const [transcriptSearch, setTranscriptSearch] =
     React.useState<TranscriptSearchState>({
       active: false,
@@ -1444,14 +1587,28 @@ export function REPL({
   const activeElicitation = elicitationQueue[0] ?? null;
   const activePrompt = promptQueue[0] ?? null;
   const isTranscriptMode = viewMode === "transcript";
+  const copyableMessages = React.useMemo(
+    () => messages.filter(isCopyableMessage),
+    [messages],
+  );
+  const rewindableMessages = React.useMemo(
+    () => messages.filter(isRewindableMessage),
+    [messages],
+  );
   const selectedTranscriptMessage =
     transcriptSelection.targetIndex !== null
-      ? messages[transcriptSelection.targetIndex] ?? null
+      ? rewindableMessages[transcriptSelection.targetIndex] ?? null
       : null;
   const selectedTranscriptCursorMessage =
-    transcriptCursorIndex !== null
-      ? messages[transcriptCursorIndex] ?? null
+    transcriptCursorId !== null
+      ? messages.find(message => message.id === transcriptCursorId) ?? null
       : null;
+  const selectedTranscriptCursorIndex =
+    selectedTranscriptCursorMessage !== null
+      ? copyableMessages.findIndex(
+          message => message.id === selectedTranscriptCursorMessage.id,
+        )
+      : -1;
   const elicitationFields = activeElicitation
     ? extractSchemaFields(activeElicitation.request.schema)
     : [];
@@ -1481,6 +1638,9 @@ export function REPL({
 
   const showSlashSuggestions =
     slashSuggestions.length > 0 &&
+    (slashCommandPortion
+      ? getSlashCommandDefinition(slashCommandPortion) === null
+      : true) &&
     dismissedSlashInput !== input;
   const slashCompletionItems = React.useMemo<CompletionItem[]>(
     () =>
@@ -1533,7 +1693,16 @@ export function REPL({
   }, [dismissedSlashInput, input]);
 
   const statusLineRows = 4;
-  const promptRows = 6;
+  const promptInputRows = input
+    ? Math.max(
+        1,
+        Math.min(
+          MAX_PROMPT_INPUT_ROWS,
+          estimateWrappedRows(input, Math.max(10, size.columns - 8)),
+        ),
+      )
+    : 1;
+  const promptRows = promptInputRows + 5;
   const selectorRows = memorySelector
     ? Math.max(8, Math.min(16, memorySelector.targets.length * 2 + 5))
     : 0;
@@ -1568,9 +1737,10 @@ export function REPL({
     (showSlashSuggestions && slashSuggestionItemRows < slashSuggestions.length
       ? 1
       : 0);
-  const bottomRows =
-    selectorRows +
-    (isTranscriptMode ? transcriptRows : promptRows);
+  const bottomRows = activePermission !== null
+    ? 0
+    : selectorRows +
+      (isTranscriptMode ? transcriptRows : promptRows);
   const messageRows = Math.max(
     4,
     size.rows -
@@ -1628,15 +1798,20 @@ export function REPL({
         screen: "repl",
         viewMode: prev.runtime.viewMode ?? "prompt",
         ...(initialSessionContext?.context?.runtime ?? {}),
-        sessionId:
-          initialSessionContext?.sessionId ??
-          initialSessionId ??
-          prev.runtime.sessionId,
-        costUsd:
-          initialSessionContext?.cost ??
-          initialCost ??
-          prev.runtime.costUsd,
-      },
+	        sessionId:
+	          initialSessionContext?.sessionId ??
+	          initialSessionId ??
+	          prev.runtime.sessionId,
+	        costUsd:
+	          initialSessionContext
+	            ? (initialSessionContext.cost ?? undefined)
+	            : (initialCost ?? prev.runtime.costUsd),
+	        phase: normalizeRestoredRuntimePhase(
+	          initialSessionContext
+	            ? initialSessionContext.context?.runtime?.phase
+	            : prev.runtime.phase,
+	        ),
+	      },
     }));
     setInputCursorOffset(0);
   }, [
@@ -2193,39 +2368,31 @@ export function REPL({
         if (!parsed) {
           return;
         }
-        const commandText = trimmed.slice(1).trim();
-        const commandHasArguments = /\s/.test(commandText);
-        const selectedSuggestion =
-          slashSuggestions[selectedSlashSuggestion] ?? null;
-        const selectedCommand = selectedSuggestion?.name ?? "";
-        const isExactCommand =
-          parsed.definition !== null &&
-          parsed.command === commandText.toLowerCase();
-
-        if (
-          showSlashSuggestions &&
-          !commandHasArguments &&
-          selectedSuggestion !== null &&
-          (!isExactCommand || selectedCommand !== parsed.command)
-        ) {
-          const nextValue = `/${selectedSuggestion.name} `;
-          setInputValue(nextValue);
-          setInputCursorOffset(nextValue.length);
-          return;
-        }
 
         rememberCommandHistory(trimmed);
 
         const command = parsed.command;
         const args = parsed.args;
+        const isLocalCommand = parsed.definition?.handler === "local";
 
         if (
-          parsed.definition?.handler === "local" &&
+          isQuerying &&
+          !isLocalCommand &&
+          !BUSY_ALLOWED_CORE_SLASH_COMMANDS.has(command)
+        ) {
+          appendMessage("status", "Task running; wait for it to finish first.");
+          return;
+        }
+
+        if (
+          isLocalCommand &&
           executeLocalSlashCommand(command, args)
         ) {
           setInputValue("");
           setInputCursorOffset(0);
-          setVimMode("INSERT");
+          if (command !== "vim") {
+            promptInputModeRef.current?.("INSERT");
+          }
           return;
         }
 
@@ -2249,7 +2416,12 @@ export function REPL({
           ],
         }));
         setInputCursorOffset(0);
-        setVimMode("INSERT");
+        promptInputModeRef.current?.("INSERT");
+        return;
+      }
+
+      if (isQuerying) {
+        appendMessage("status", "Task running; wait for it to finish first.");
         return;
       }
 
@@ -2280,17 +2452,16 @@ export function REPL({
         ],
       }));
       setInputCursorOffset(0);
-      setVimMode("INSERT");
+      promptInputModeRef.current?.("INSERT");
     },
     [
       executeLocalSlashCommand,
+      appendMessage,
       io,
+      isQuerying,
       rememberCommandHistory,
-      selectedSlashSuggestion,
       setAppState,
       setInputValue,
-      showSlashSuggestions,
-      slashSuggestions,
     ],
   );
 
@@ -2695,27 +2866,27 @@ export function REPL({
   const handleTranscriptCursorChange = React.useCallback(
     (cursor: MessageActionsState | null): void => {
       if (!cursor) {
-        setTranscriptCursorIndex(null);
+        setTranscriptCursorId(null);
         return;
       }
 
-      const index = messages.findIndex(message => message.id === cursor.id);
-      setTranscriptCursorIndex(index >= 0 ? index : null);
+      setTranscriptCursorId(cursor.id);
     },
-    [messages],
+    [],
   );
 
   React.useEffect(() => {
     if (
-      transcriptCursorIndex !== null &&
-      (transcriptCursorIndex < 0 || transcriptCursorIndex >= messages.length)
+      transcriptCursorId !== null &&
+      !messages.some(message => message.id === transcriptCursorId)
     ) {
-      setTranscriptCursorIndex(null);
+      setTranscriptCursorId(null);
     }
-  }, [messages.length, transcriptCursorIndex]);
+  }, [messages, transcriptCursorId]);
 
   const openTranscriptSelector = React.useCallback((): void => {
-    if (messages.length === 0) {
+    if (rewindableMessages.length === 0) {
+      appendMessage("error", "No rewindable transcript messages are available.");
       return;
     }
 
@@ -2723,15 +2894,15 @@ export function REPL({
       ...prev,
       active: true,
       selectedIndex: clampMessageIndex(
-        prev.targetIndex ?? messages.length - 1,
-        messages.length,
+        prev.targetIndex ?? rewindableMessages.length - 1,
+        rewindableMessages.length,
       ),
     }));
-  }, [messages.length]);
+  }, [appendMessage, rewindableMessages.length]);
 
   const moveTranscriptSelector = React.useCallback(
     (delta: number): void => {
-      if (messages.length === 0) {
+      if (rewindableMessages.length === 0) {
         return;
       }
 
@@ -2739,29 +2910,32 @@ export function REPL({
         ...prev,
         selectedIndex: clampMessageIndex(
           prev.selectedIndex + delta,
-          messages.length,
+          rewindableMessages.length,
         ),
       }));
     },
-    [messages.length],
+    [rewindableMessages.length],
   );
 
   const confirmTranscriptSelection = React.useCallback((): void => {
-    if (messages.length === 0) {
+    if (rewindableMessages.length === 0) {
       return;
     }
 
     const targetIndex = clampMessageIndex(
       transcriptSelection.selectedIndex,
-      messages.length,
+      rewindableMessages.length,
     );
+    const targetMessage = rewindableMessages[targetIndex];
     setTranscriptSelection(prev => ({
       ...prev,
       active: false,
       targetIndex,
     }));
-    jumpRef.current?.jumpToIndex(targetIndex);
-  }, [messages.length, transcriptSelection.selectedIndex]);
+    if (targetMessage) {
+      jumpRef.current?.jumpToMessageId?.(targetMessage.id);
+    }
+  }, [rewindableMessages, transcriptSelection.selectedIndex]);
 
   const clearTranscriptSelection = React.useCallback((): void => {
     setTranscriptSelection(prev => ({
@@ -2770,6 +2944,42 @@ export function REPL({
       targetIndex: null,
     }));
   }, []);
+
+  React.useEffect(() => {
+    setTranscriptSelection(prev => {
+      if (rewindableMessages.length === 0) {
+        return prev.targetIndex === null && prev.selectedIndex === 0
+          ? prev
+          : {
+              ...prev,
+              selectedIndex: 0,
+              targetIndex: null,
+            };
+      }
+
+      const selectedIndex = clampMessageIndex(
+        prev.selectedIndex,
+        rewindableMessages.length,
+      );
+      const targetIndex =
+        prev.targetIndex === null
+          ? null
+          : clampMessageIndex(prev.targetIndex, rewindableMessages.length);
+
+      if (
+        selectedIndex === prev.selectedIndex &&
+        targetIndex === prev.targetIndex
+      ) {
+        return prev;
+      }
+
+      return {
+        ...prev,
+        selectedIndex,
+        targetIndex,
+      };
+    });
+  }, [rewindableMessages.length]);
 
   const requestTranscriptMutation = React.useCallback(
     (
@@ -2786,6 +2996,11 @@ export function REPL({
         return;
       }
 
+      if (isQuerying) {
+        appendMessage("error", "Wait for the active query to finish before rewinding.");
+        return;
+      }
+
       setTranscriptMutation(mutation);
       io.send({
         type: "resume_session",
@@ -2796,7 +3011,7 @@ export function REPL({
         },
       });
     },
-    [appendMessage, io, runtime.sessionId],
+    [appendMessage, io, isQuerying, runtime.sessionId],
   );
 
   const rewindTranscript = React.useCallback((): void => {
@@ -2809,12 +3024,12 @@ export function REPL({
       return;
     }
 
-    const nextMessages = messages.slice(0, targetIndex + 1);
+    const nextMessages = rewindableMessages.slice(0, targetIndex + 1);
     if (nextMessages.length === 0) {
       return;
     }
 
-    setTranscriptRestoreBuffer(prev => prev ?? messages);
+    setTranscriptRestoreBuffer(prev => prev ?? rewindableMessages);
     setTranscriptSelection(prev => ({
       ...prev,
       active: false,
@@ -2822,8 +3037,8 @@ export function REPL({
     requestTranscriptMutation(nextMessages, "rewind");
   }, [
     appendMessage,
-    messages,
     requestTranscriptMutation,
+    rewindableMessages,
     transcriptSelection.targetIndex,
   ]);
 
@@ -3051,7 +3266,7 @@ export function REPL({
       ...prev,
       active: false,
     }));
-    setTranscriptCursorIndex(null);
+    setTranscriptCursorId(null);
     closeTranscriptSearch();
     setViewMode("prompt");
     setRuntimeViewMode(
@@ -3079,15 +3294,16 @@ export function REPL({
   }, []);
 
   const exportCurrentTranscript = React.useCallback((): void => {
-    const selectedIndex = transcriptCursorIndex;
+    const selectedMessage =
+      transcriptCursorId !== null
+        ? messages.find(message => message.id === transcriptCursorId)
+        : undefined;
     const exportedMessages =
-      selectedIndex !== null
-        ? [messages[selectedIndex]].filter(
-            (message): message is AppMessage => message !== undefined,
-          )
-        : messages;
+      selectedMessage !== undefined
+        ? [selectedMessage]
+        : messages.filter(isCopyableMessage);
     const exportLabel =
-      selectedIndex !== null ? `message #${selectedIndex + 1}` : "transcript";
+      selectedMessage !== undefined ? "selected message" : "transcript";
     const configuredPath = settingsApi.getSetting<string | undefined>(
       "transcriptExportPath",
       undefined,
@@ -3098,7 +3314,7 @@ export function REPL({
       sessionId: runtime.sessionId ?? null,
       sessionTitle: sessionContext?.title ?? null,
       sessionContext,
-      selectionIndex: selectedIndex !== null ? 0 : null,
+      selectionIndex: selectedMessage !== undefined ? 0 : null,
       outputPath:
         typeof configuredPath === "string" && configuredPath.trim().length > 0
           ? configuredPath
@@ -3122,30 +3338,31 @@ export function REPL({
     runtime.sessionId,
     sessionContext,
     settingsApi,
-    transcriptCursorIndex,
+    transcriptCursorId,
   ]);
 
   const openTranscriptInExternalEditor = React.useCallback((): void => {
-    const selectedIndex = transcriptCursorIndex;
+    const selectedMessage =
+      transcriptCursorId !== null
+        ? messages.find(message => message.id === transcriptCursorId)
+        : undefined;
     const exportedMessages =
-      selectedIndex !== null
-        ? [messages[selectedIndex]].filter(
-            (message): message is AppMessage => message !== undefined,
-          )
-        : messages;
+      selectedMessage !== undefined
+        ? [selectedMessage]
+        : messages.filter(isCopyableMessage);
     const configuredEditor = settingsApi.getSetting<string | undefined>(
       "externalEditor",
       undefined,
     );
     const label =
-      selectedIndex !== null ? `message #${selectedIndex + 1}` : "transcript";
+      selectedMessage !== undefined ? "selected message" : "transcript";
 
     void prepareTranscriptEditorFile({
       messages: exportedMessages,
       sessionId: runtime.sessionId ?? null,
       sessionTitle: sessionContext?.title ?? null,
       sessionContext,
-      selectionIndex: selectedIndex !== null ? 0 : null,
+      selectionIndex: selectedMessage !== undefined ? 0 : null,
     })
       .then(filePath => {
         const result = openPathInExternalEditor(filePath, configuredEditor);
@@ -3173,22 +3390,34 @@ export function REPL({
     runtime.sessionId,
     sessionContext,
     settingsApi,
-    transcriptCursorIndex,
+    transcriptCursorId,
   ]);
 
   const targetTranscriptCursor = React.useCallback((): void => {
-    if (transcriptCursorIndex === null) {
+    if (transcriptCursorId === null) {
       appendMessage("error", "Move the transcript cursor onto a message first.");
       return;
     }
 
+    const targetIndex = rewindableMessages.findIndex(
+      message => message.id === transcriptCursorId,
+    );
+    if (targetIndex < 0) {
+      appendMessage(
+        "error",
+        "Choose a user, assistant, tool, or system message before rewinding.",
+      );
+      return;
+    }
+    const targetMessage = rewindableMessages[targetIndex]!;
+
     setTranscriptSelection(prev => ({
       ...prev,
       active: false,
-      targetIndex: transcriptCursorIndex,
+      targetIndex,
     }));
-    jumpRef.current?.jumpToIndex(transcriptCursorIndex);
-  }, [appendMessage, transcriptCursorIndex]);
+    jumpRef.current?.jumpToMessageId?.(targetMessage.id);
+  }, [appendMessage, rewindableMessages, transcriptCursorId]);
 
   const clearPrompt = React.useCallback((): void => {
     setInputValue("");
@@ -3214,12 +3443,8 @@ export function REPL({
       type: "cancel",
       data: { reason: "tui_keybinding_cancel" },
     });
-    setAppState(prev => ({
-      ...prev,
-      isQuerying: false,
-    }));
     appendMessage("status", "Cancellation requested");
-  }, [appendMessage, clearPrompt, io, isQuerying, setAppState]);
+  }, [appendMessage, clearPrompt, io, isQuerying]);
 
   const cancelMemorySelector = React.useCallback((): void => {
     setMemorySelector(null);
@@ -3553,26 +3778,18 @@ export function REPL({
     {
       "confirm:yes": () => {
         if (activePermission) {
-          if (isAskUserQuestionRequest(activePermission)) {
-            return false;
-          }
-          resolvePermission("allow");
-          return;
+          return false;
         }
         submitElicitation(false);
       },
       "confirm:no": () => {
         if (activePermission) {
-          if (isAskUserQuestionRequest(activePermission)) {
-            return false;
-          }
-          resolvePermission("deny");
-          return;
+          return false;
         }
         submitElicitation(true);
       },
       "confirm:next": () => {
-        if (activePermission && isAskUserQuestionRequest(activePermission)) {
+        if (activePermission) {
           return false;
         }
         if (activeElicitation) {
@@ -3580,7 +3797,7 @@ export function REPL({
         }
       },
       "confirm:previous": () => {
-        if (activePermission && isAskUserQuestionRequest(activePermission)) {
+        if (activePermission) {
           return false;
         }
         if (activeElicitation) {
@@ -3588,7 +3805,7 @@ export function REPL({
         }
       },
       "confirm:nextField": () => {
-        if (activePermission && isAskUserQuestionRequest(activePermission)) {
+        if (activePermission) {
           return false;
         }
         if (activeElicitation) {
@@ -3596,7 +3813,7 @@ export function REPL({
         }
       },
       "confirm:previousField": () => {
-        if (activePermission && isAskUserQuestionRequest(activePermission)) {
+        if (activePermission) {
           return false;
         }
         if (activeElicitation) {
@@ -3605,13 +3822,7 @@ export function REPL({
       },
       "permission:allowAlways": () => {
         if (activePermission) {
-          if (
-            isAskUserQuestionRequest(activePermission) ||
-            !canResolveAllowAlways(activePermission)
-          ) {
-            return false;
-          }
-          resolvePermission("allow_always");
+          return false;
         }
       },
     },
@@ -3628,7 +3839,7 @@ export function REPL({
       }
 
       if (activePermission) {
-        return;
+        return false;
       }
 
       if (activePrompt) {
@@ -3765,6 +3976,18 @@ export function REPL({
           );
         }
         return;
+      }
+
+      if (vimMode === "INSERT") {
+        const chunkSubmitValue = applyInputChunkBeforeSubmit(
+          inputRef.current,
+          inputCursorOffsetRef.current,
+          value,
+        );
+        if (chunkSubmitValue !== null) {
+          submitPrompt(chunkSubmitValue);
+          return;
+        }
       }
 
       promptInput.onInput(value, key);
@@ -3996,7 +4219,7 @@ export function REPL({
 
         case "tool_complete": {
           const data = message.data as ToolCompleteData;
-          const result = summarizeToolResult(data.result);
+          const result = summarizeToolComplete(data);
           setAppState(prev => {
             const updated = updateToolUseMessage(
               prev.messages,
@@ -4629,6 +4852,9 @@ export function REPL({
 
         case "agent_list": {
           const data = message.data as AgentListData;
+          if (isStaleSessionEvent(runtime.sessionId, data.session_id)) {
+            return;
+          }
           if (
             typeof data.session_id === "string" &&
             data.session_id !== agentsRuntime.sessionId
@@ -4636,6 +4862,10 @@ export function REPL({
             clearAgentTranscriptSearch();
           }
           setAppState(prev => {
+            if (isStaleSessionEvent(prev.runtime.sessionId, data.session_id)) {
+              return prev;
+            }
+
             const nextSessionId =
               typeof data.session_id === "string"
                 ? (data.session_id ?? prev.agents.sessionId)
@@ -4695,14 +4925,20 @@ export function REPL({
 
         case "agent_event": {
           const data = message.data as AgentEventData;
-          setAppState(prev => ({
-            ...prev,
-            agents: applyAgentEventData(
-              prev.agents,
-              data,
-              message.timestamp ?? Date.now(),
-            ),
-          }));
+          setAppState(prev => {
+            if (isStaleSessionEvent(prev.runtime.sessionId, data.session_id)) {
+              return prev;
+            }
+
+            return {
+              ...prev,
+              agents: applyAgentEventData(
+                prev.agents,
+                data,
+                message.timestamp ?? Date.now(),
+              ),
+            };
+          });
           return;
         }
 
@@ -4713,6 +4949,7 @@ export function REPL({
         case "agent_complete": {
           const data = message.data as RuntimeActivityData;
           const payload = asRecord(data);
+          const eventSessionId = getStringValue(payload, ["session_id", "sessionId"]);
           const status = runtimeActivityStatus(message.type, payload);
           const timestamp = eventTimestamp(
             data.timestamp,
@@ -4728,31 +4965,43 @@ export function REPL({
               hidden: !shouldDisplayAgentRuntimeActivity(message.type, status),
             },
           );
-          setAppState(prev => ({
-            ...prev,
-            agents: applyAgentPayloadEvent(
-              prev.agents,
-              message.type,
-              payload,
-              timestamp,
-              getStringValue(payload, ["session_id", "sessionId"]),
-            ),
-          }));
+          setAppState(prev => {
+            if (isStaleSessionEvent(prev.runtime.sessionId, eventSessionId)) {
+              return prev;
+            }
+
+            return {
+              ...prev,
+              agents: applyAgentPayloadEvent(
+                prev.agents,
+                message.type,
+                payload,
+                timestamp,
+                eventSessionId,
+              ),
+            };
+          });
           return;
         }
 
         case "agent_spawn": {
           const data = message.data as AgentSpawnData;
-          setAppState(prev => ({
-            ...prev,
-            agents: applyAgentPayloadEvent(
-              prev.agents,
-              "agent_spawn",
-              asRecord(data),
-              message.timestamp ?? Date.now(),
-              data.session_id,
-            ),
-          }));
+          setAppState(prev => {
+            if (isStaleSessionEvent(prev.runtime.sessionId, data.session_id)) {
+              return prev;
+            }
+
+            return {
+              ...prev,
+              agents: applyAgentPayloadEvent(
+                prev.agents,
+                "agent_spawn",
+                asRecord(data),
+                message.timestamp ?? Date.now(),
+                data.session_id,
+              ),
+            };
+          });
           return;
         }
 
@@ -4763,72 +5012,96 @@ export function REPL({
         case "task_failed":
         case "task_stopped": {
           const data = message.data as AgentTaskUpdateData;
-          setAppState(prev => ({
-            ...prev,
-            agents: applyAgentPayloadEvent(
-              prev.agents,
-              message.type,
-              asRecord(data),
-              message.timestamp ?? Date.now(),
-              data.session_id,
-            ),
-          }));
+          setAppState(prev => {
+            if (isStaleSessionEvent(prev.runtime.sessionId, data.session_id)) {
+              return prev;
+            }
+
+            return {
+              ...prev,
+              agents: applyAgentPayloadEvent(
+                prev.agents,
+                message.type,
+                asRecord(data),
+                message.timestamp ?? Date.now(),
+                data.session_id,
+              ),
+            };
+          });
           return;
         }
 
         case "team_update": {
           const data = message.data as TeamUpdateData;
-          setAppState(prev => ({
-            ...prev,
-            agents: applyAgentPayloadEvent(
-              prev.agents,
-              "team_update",
-              asRecord(data),
-              message.timestamp ?? Date.now(),
-              data.session_id,
-            ),
-          }));
+          setAppState(prev => {
+            if (isStaleSessionEvent(prev.runtime.sessionId, data.session_id)) {
+              return prev;
+            }
+
+            return {
+              ...prev,
+              agents: applyAgentPayloadEvent(
+                prev.agents,
+                "team_update",
+                asRecord(data),
+                message.timestamp ?? Date.now(),
+                data.session_id,
+              ),
+            };
+          });
           return;
         }
 
         case "todo_update": {
           const data = message.data as TodoUpdateData;
-          setAppState(prev => ({
-            ...prev,
-            agents: applyAgentPayloadEvent(
-              prev.agents,
-              "todo_update",
-              asRecord(data),
-              message.timestamp ?? Date.now(),
-              data.session_id,
-            ),
-          }));
+          setAppState(prev => {
+            if (isStaleSessionEvent(prev.runtime.sessionId, data.session_id)) {
+              return prev;
+            }
+
+            return {
+              ...prev,
+              agents: applyAgentPayloadEvent(
+                prev.agents,
+                "todo_update",
+                asRecord(data),
+                message.timestamp ?? Date.now(),
+                data.session_id,
+              ),
+            };
+          });
           return;
         }
 
         case "agent_transcript": {
           const data = message.data as AgentTranscriptData;
           const transcriptAgentId = data.agent_id ?? "primary";
-          setAppState(prev => ({
-            ...prev,
-            agents: {
-              ...prev.agents,
-              sessionId:
-                typeof data.session_id === "string"
-                  ? data.session_id
-                  : prev.agents.sessionId,
-              viewedAgentId: prev.agents.viewedAgentId ?? transcriptAgentId,
-              transcripts: {
-                ...prev.agents.transcripts,
-                [transcriptAgentId]: normalizeExternalMessages(
-                  Array.isArray(data.messages) ? data.messages : [],
-                ),
+          setAppState(prev => {
+            if (isStaleSessionEvent(prev.runtime.sessionId, data.session_id)) {
+              return prev;
+            }
+
+            return {
+              ...prev,
+              agents: {
+                ...prev.agents,
+                sessionId:
+                  typeof data.session_id === "string"
+                    ? data.session_id
+                    : prev.agents.sessionId,
+                viewedAgentId: prev.agents.viewedAgentId ?? transcriptAgentId,
+                transcripts: {
+                  ...prev.agents.transcripts,
+                  [transcriptAgentId]: normalizeExternalMessages(
+                    Array.isArray(data.messages) ? data.messages : [],
+                  ),
+                },
+                transcriptCursor: Array.isArray(data.messages)
+                  ? Math.max(0, data.messages.length - 1)
+                  : prev.agents.transcriptCursor,
               },
-              transcriptCursor: Array.isArray(data.messages)
-                ? Math.max(0, data.messages.length - 1)
-                : prev.agents.transcriptCursor,
-            },
-          }));
+            };
+          });
           return;
         }
 
@@ -4906,11 +5179,14 @@ export function REPL({
             inputMode: "insert",
             isQuerying: false,
             sessionContext,
-            runtime: {
-              ...prev.runtime,
-              ...sessionContext.runtime,
-              sessionId: data.session_id,
-              costUsd: data.cost ?? prev.runtime.costUsd,
+	      runtime: {
+	        ...prev.runtime,
+	        ...sessionContext.runtime,
+	        sessionId: data.session_id,
+	        costUsd: data.cost ?? undefined,
+	        phase: normalizeRestoredRuntimePhase(
+	          sessionContext.runtime?.phase,
+	        ),
               viewMode:
                 prev.footerSelection === "agents"
                   ? "agent"
@@ -4924,7 +5200,7 @@ export function REPL({
             ],
           }));
           setInputCursorOffset(0);
-          setVimMode("INSERT");
+          promptInputModeRef.current?.("INSERT");
           return;
         }
 
@@ -4997,6 +5273,7 @@ export function REPL({
       markTaskStart,
       markTaskComplete,
       markTaskError,
+      runtime.sessionId,
       setAppState,
       submitPrompt,
       transcriptMutation,
@@ -5163,6 +5440,15 @@ export function REPL({
       }),
     [messages, showAllMessages, size.columns],
   );
+  const permissionSurfaceRows = activePermission
+    ? Math.max(
+        6,
+        Math.min(
+          18,
+          size.rows - statusLineRows - bottomRows - 1,
+        ),
+      )
+    : 0;
   const auxiliarySurfaceHeight =
     (expandedView === "tasks" || footerSelection === "tasks"
       ? Math.max(
@@ -5184,7 +5470,7 @@ export function REPL({
       : 0) +
     (showAgentsPanel ? 26 : 0) +
     (showBackgroundPanel ? 18 : 0) +
-    (activePermission ? 9 : 0) +
+    permissionSurfaceRows +
     (memorySelector
       ? Math.max(8, Math.min(16, memorySelector.targets.length * 2 + 5))
       : 0) +
@@ -5219,6 +5505,7 @@ export function REPL({
       messageViewportRows,
       messageSurfaceHeight,
       auxiliarySurfaceHeight,
+      permissionSurfaceRows,
       layoutContentHeight,
       messages: messages.length,
       inputLength: input.length,
@@ -5251,6 +5538,7 @@ export function REPL({
     messageSurfaceHeight,
     messages.length,
     modalRows,
+    permissionSurfaceRows,
     promptRows,
     selectorRows,
     showSlashSuggestions,
@@ -5262,7 +5550,20 @@ export function REPL({
     transcriptRows,
   ]);
 
-  const bottomContent = (
+  const inputDisabledReason =
+    activePermission !== null
+      ? "Awaiting your permission decision"
+      : activeElicitation !== null
+        ? "Complete the active MCP prompt"
+        : activePrompt !== null
+          ? "Complete the active prompt"
+          : compactProgress !== null
+            ? "Compacting conversation context"
+            : undefined;
+
+  const bottomContent = activePermission !== null ? (
+    <Box height={0} width="100%" />
+  ) : (
     <Box
       flexDirection="column"
       height={bottomRows}
@@ -5278,24 +5579,24 @@ export function REPL({
       ) : null}
 
       {isTranscriptMode ? (
-        <TranscriptModeFooter
-          messageCount={messages.length}
+	        <TranscriptModeFooter
+	          messageCount={copyableMessages.length}
           showAllInTranscript={showAllInTranscript}
           searchQuery={transcriptSearch.query}
           searchMatchCount={transcriptSearch.matchCount}
           searchCurrentMatch={transcriptSearch.currentMatch}
-          cursorMessageLabel={
-            selectedTranscriptCursorMessage
-              ? `#${(transcriptCursorIndex ?? 0) + 1} ${truncate(
-                  getMessageText(selectedTranscriptCursorMessage).replace(/\s+/g, " ").trim() ||
-                    selectedTranscriptCursorMessage.role,
-                  72,
+	          cursorMessageLabel={
+	            selectedTranscriptCursorMessage
+	              ? `#${Math.max(1, selectedTranscriptCursorIndex + 1)} ${truncate(
+	                  getMessageText(selectedTranscriptCursorMessage).replace(/\s+/g, " ").trim() ||
+	                    selectedTranscriptCursorMessage.role,
+	                  72,
                 )}`
               : null
           }
-          selectedMessageLabel={
-            selectedTranscriptMessage
-              ? `#${(transcriptSelection.targetIndex ?? 0) + 1} ${truncate(
+	          selectedMessageLabel={
+	            selectedTranscriptMessage
+	              ? `#${(transcriptSelection.targetIndex ?? 0) + 1} ${truncate(
                   getMessageText(selectedTranscriptMessage).replace(/\s+/g, " ").trim() ||
                     selectedTranscriptMessage.role,
                   72,
@@ -5313,6 +5614,7 @@ export function REPL({
             activeElicitation !== null ||
             activePrompt !== null
           }
+          disabledReason={inputDisabledReason}
           busy={isQuerying}
           inputMode={getModeFromInput(input)}
           vimMode={vimMode}
@@ -5322,6 +5624,7 @@ export function REPL({
           showSuggestions={showSlashSuggestions}
           renderSuggestionsInline={false}
           publishSuggestionsOverlay={false}
+          maxInputRows={MAX_PROMPT_INPUT_ROWS}
           sandbox={runtime.sandbox}
         />
       )}
@@ -5386,12 +5689,12 @@ export function REPL({
             />
           ) : activePrompt ? (
             <PromptDialog draft={activePrompt} />
-          ) : isTranscriptMode && transcriptSelection.active ? (
-            <MessageSelector
-              messages={messages}
-              selectedIndex={transcriptSelection.selectedIndex}
-              targetIndex={transcriptSelection.targetIndex}
-            />
+	          ) : isTranscriptMode && transcriptSelection.active ? (
+	            <MessageSelector
+	              messages={rewindableMessages}
+	              selectedIndex={transcriptSelection.selectedIndex}
+	              targetIndex={transcriptSelection.targetIndex}
+	            />
           ) : undefined
         }
         bottomFloat={

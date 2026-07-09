@@ -210,18 +210,6 @@ def _first_text(*values: Any) -> str | None:
     return None
 
 
-def _package_path_segments(package_path: str) -> tuple[str, ...]:
-    return tuple(
-        segment.strip().lower()
-        for segment in str(package_path or "").replace("\\", "/").split("/")
-        if segment.strip()
-    )
-
-
-def _is_ancestor_path(parent: tuple[str, ...], child: tuple[str, ...]) -> bool:
-    return bool(parent) and len(parent) < len(child) and child[: len(parent)] == parent
-
-
 def is_package_projection_not_ready(error: BaseException) -> bool:
     return isinstance(error, CloudError) and error.code == "PACKAGE_PROJECTION_NOT_READY"
 
@@ -491,31 +479,27 @@ class OpenSpaceClient:
                 self._cache_package_pull(pull)
         return result
 
-    def search_package_skills(
+    def search_skills(
         self,
-        package_id: str,
         *,
         query: str,
+        package_id: str | None = None,
         audience: str = "requester_visible",
         limit: int = 10,
-        mode: str = "auto",
         artifact_filter: str = "all",
         request_id: str | None = None,
     ) -> Dict[str, Any]:
-        """POST /api/v2/packages/{package_id}/skills/search."""
+        """POST /api/v2/skills/search — skill-first lexical search."""
         payload: Dict[str, Any] = {
             "request_id": request_id or f"skill-search-{uuid.uuid4().hex}",
             "query": query,
             "audience": audience,
             "limit": min(max(limit, 1), V2_RECALL_SEARCH_MAX_LIMIT),
-            "mode": mode,
             "artifact_filter": artifact_filter,
         }
-        return self._post_v2_json(
-            f"/packages/{self._quote_id(package_id)}/skills/search",
-            payload,
-            timeout=30,
-        )
+        if package_id:
+            payload["package_id"] = package_id
+        return self._post_v2_json("/skills/search", payload, timeout=30)
 
     def fetch_cloud_skill(self, cloud_skill_id: str) -> Dict[str, Any]:
         """GET /api/v2/skills/{cloud_skill_id}."""
@@ -715,226 +699,54 @@ class OpenSpaceClient:
         audience: str = "requester_visible",
         task_id: str | None = None,
     ) -> List[Dict[str, Any]]:
-        """Search v2 packages and return concrete skill rows.
+        """Search v2 cloud skills and return concrete skill rows.
 
-        The cloud search surface is package-first.  This method performs a
-        two-stage narrowing pass:
-
-        1. ``/recall/search`` finds likely package roots and preview skills.
-        2. ``/packages/{id}/skills/search`` ranks concrete skills inside the
-           strongest package subtrees.  ``/packages/pull`` is only a fallback
-           when the skill-level search path yields no concrete candidates.
+        This is intentionally skill-first only. Package recall/projection remains
+        available through explicit package-browsing APIs, but it is not used as
+        an implicit cloud skill search fallback.
         """
         skill_limit = min(max(limit, 1), V2_RECALL_SEARCH_MAX_LIMIT)
-        package_limit = min(max(skill_limit * 2, 8), V2_RECALL_SEARCH_MAX_LIMIT)
-        search = self.search_packages(
-            query=query,
-            audience=audience,
-            limit=package_limit,
-            task_id=task_id,
-        )
-        results = [
-            item for item in (search.get("results") or [])
-            if isinstance(item, dict)
-        ]
-        preview_by_skill_id: Dict[str, Dict[str, Any]] = {}
-        package_path_by_id: Dict[str, str] = {}
-        package_rank_by_id: Dict[str, int] = {}
-        package_score_by_id: Dict[str, float] = {}
-        package_candidates: List[Dict[str, Any]] = []
 
-        for index, package in enumerate(results):
-            package_id = str(package.get("package_id") or "")
-            if not package_id:
-                continue
-            package_path = str(package.get("package_path") or "")
-            package_path_by_id[package_id] = package_path
-            package_rank_by_id[package_id] = int(package.get("rank") or index + 1)
-            if isinstance(package.get("score"), (int, float)):
-                package_score_by_id[package_id] = float(package["score"])
-            package_candidates.append(package)
-            for preview in package.get("preview_entries") or []:
-                if isinstance(preview, dict) and preview.get("cloud_skill_id"):
-                    preview_by_skill_id[str(preview["cloud_skill_id"])] = {
-                        **preview,
-                        "package_id": package_id,
-                        "package_path": package_path,
-                        "summary_line": package.get("summary_line", ""),
-                        "display_scope": package.get("display_scope", ""),
-                        "package_rank": package_rank_by_id[package_id],
-                        "package_score": package_score_by_id.get(package_id),
-                    }
-
-        max_package_roots = min(max(skill_limit, 4), 12)
-        packages_for_projection = self._dedupe_ranked_packages(
-            package_candidates,
-            max_roots=max_package_roots,
-        )
-        selected_packages = self._select_skill_search_packages(
-            package_candidates,
-            max_roots=max_package_roots,
-        )
-        search_id = search.get("search_id")
-        pulled: Dict[str, Any] = {}
-        package_ids = [
-            str(item.get("package_id") or "")
-            for item in packages_for_projection
-            if item.get("package_id")
-        ]
-        if search_id and package_ids:
-            try:
-                pulled = self.pull_packages(
-                    package_ids=package_ids[: min(len(package_ids), 50)],
-                    search_id=str(search_id),
-                    audience=audience,
-                )
-            except CloudError as exc:
-                if not is_package_projection_not_ready(exc):
-                    raise
-                logger.info(
-                    "search_cloud_skills: package projection not ready for "
-                    "search_id=%s; continuing with search previews and package skill search",
-                    search_id,
-                )
-                pulled = {}
-
-        skill_search_candidates: Dict[str, Dict[str, Any]] = {}
-        skill_search_errors: list[CloudError] = []
-        for package in selected_packages:
-            package_id = str(package.get("package_id") or "")
-            if not package_id:
-                continue
-            try:
-                skill_search = self.search_package_skills(
-                    package_id,
-                    query=query,
-                    audience=audience,
-                    limit=min(max(skill_limit, 5), V2_RECALL_SEARCH_MAX_LIMIT),
-                    mode="auto",
-                    artifact_filter="downloadable_only",
-                )
-            except CloudError as exc:
-                if exc.status_code in (401, 403):
-                    raise
-                skill_search_errors.append(exc)
-                logger.info(
-                    "search_cloud_skills: package skill search failed for %s: %s",
-                    package_id,
-                    exc,
-                )
-                continue
-            root_package_id = str(skill_search.get("root_package_id") or package_id)
-            root_package_path = str(
-                skill_search.get("root_package_path")
-                or package_path_by_id.get(root_package_id, "")
-                or package.get("package_path")
-                or ""
+        try:
+            skill_search = self.search_skills(
+                query=query,
+                audience=audience,
+                limit=skill_limit,
+                artifact_filter="downloadable_only",
             )
-            for result_index, skill in enumerate(skill_search.get("results") or []):
-                if not isinstance(skill, dict):
-                    continue
-                skill_id = str(skill.get("cloud_skill_id") or "")
-                if not skill_id:
-                    continue
-                skill_search_candidates[skill_id] = {
-                    **skill,
-                    "root_package_id": root_package_id,
-                    "root_package_path": root_package_path,
-                    "skill_search_id": skill_search.get("skill_search_id"),
-                    "requested_mode": skill_search.get("requested_mode"),
-                    "served_mode": skill_search.get("served_mode"),
-                    "semantic_status": skill_search.get("semantic_status"),
-                    "fallback_reason": skill_search.get("fallback_reason"),
-                    "_package_recall_rank": package_rank_by_id.get(package_id, result_index + 1),
-                    "_package_recall_score": package_score_by_id.get(package_id),
-                    "_skill_search_order": result_index,
-                }
-
-        candidates: Dict[str, Dict[str, Any]] = {}
-        insertion_order = 0
-
-        def merge_candidate(skill_id: str, data: Dict[str, Any], priority: int) -> None:
-            nonlocal insertion_order
-            if not skill_id:
-                return
-            enriched = dict(data)
-            enriched["_candidate_priority"] = priority
-            if skill_id not in candidates:
-                enriched["_candidate_order"] = insertion_order
-                insertion_order += 1
-                candidates[skill_id] = enriched
-                return
-            existing = candidates[skill_id]
-            existing_priority = int(existing.get("_candidate_priority", 99))
-            if priority < existing_priority:
-                merged = dict(enriched)
-                for key, value in existing.items():
-                    if key not in merged or merged.get(key) in (None, "", [], {}):
-                        merged[key] = value
-                merged["_candidate_order"] = existing.get("_candidate_order", insertion_order)
-                candidates[skill_id] = merged
-                return
-            for key, value in enriched.items():
-                if existing.get(key) in (None, "", [], {}) and value not in (None, "", [], {}):
-                    existing[key] = value
-
-        for skill_id, skill in skill_search_candidates.items():
-            merge_candidate(skill_id, skill, priority=0)
-
-        for pull in pulled.get("pulls") or []:
-            if not isinstance(pull, dict):
-                continue
-            root_package_id = str(pull.get("root_package_id") or "")
-            root_package_path = str(pull.get("root_package_path") or package_path_by_id.get(root_package_id, ""))
-            for skill in pull.get("skills") or []:
-                if not isinstance(skill, dict):
-                    continue
-                skill_id = str(skill.get("cloud_skill_id") or "")
-                if not skill_id:
-                    continue
-                merge_candidate(
-                    skill_id,
-                    {
-                        **skill,
-                        "root_package_id": root_package_id,
-                        "root_package_path": root_package_path,
-                        "source_api": "v2/package-pull",
-                        "_package_recall_rank": package_rank_by_id.get(root_package_id),
-                        "_package_recall_score": package_score_by_id.get(root_package_id),
-                    },
-                    priority=1,
-                )
-        for skill_id, preview in preview_by_skill_id.items():
-            merge_candidate(skill_id, preview, priority=2)
-
-        if not candidates and skill_search_errors:
+            return self._skill_first_search_rows(skill_search, skill_limit)
+        except CloudError as exc:
+            if exc.status_code in (401, 403):
+                raise
             logger.info(
-                "search_cloud_skills: no concrete skill candidates after %d package skill search error(s)",
-                len(skill_search_errors),
+                "search_cloud_skills: skill-first search failed without package fallback: %s",
+                exc,
             )
+            return []
 
+    def _skill_first_search_rows(
+        self,
+        payload: Dict[str, Any],
+        limit: int,
+    ) -> List[Dict[str, Any]]:
         rows: List[Dict[str, Any]] = []
         seen: set[str] = set()
+        root_package_id = str(payload.get("root_package_id") or "")
+        root_package_path = str(payload.get("root_package_path") or "")
+        skill_search_id = str(payload.get("skill_search_id") or "")
+        requested_mode = str(payload.get("requested_mode") or "")
+        served_mode = str(payload.get("served_mode") or "")
+        semantic_status = str(payload.get("semantic_status") or "")
+        fallback_reason = str(payload.get("fallback_reason") or "")
 
-        def candidate_sort_key(item: tuple[str, Dict[str, Any]]) -> tuple[int, float, int, int]:
-            _, candidate = item
-            priority = int(candidate.get("_candidate_priority", 99))
-            raw_score = candidate.get("score")
-            if not isinstance(raw_score, (int, float)):
-                raw_score = candidate.get("_package_recall_score")
-            score = float(raw_score) if isinstance(raw_score, (int, float)) else 0.0
-            rank = candidate.get("rank")
-            if not isinstance(rank, int):
-                rank = candidate.get("_package_recall_rank")
-            rank_value = int(rank) if isinstance(rank, int) else 9999
-            order = int(candidate.get("_candidate_order", 9999))
-            return (priority, -score, rank_value, order)
-
-        def add_skill_row(skill_id: str, candidate: Dict[str, Any]) -> None:
-            if not skill_id or skill_id in seen or len(rows) >= skill_limit:
-                return
+        for index, candidate in enumerate(payload.get("results") or []):
+            if not isinstance(candidate, dict):
+                continue
+            skill_id = str(candidate.get("cloud_skill_id") or "")
+            if not skill_id or skill_id in seen:
+                continue
             seen.add(skill_id)
-            preview = preview_by_skill_id.get(skill_id, {})
+
             try:
                 detail = self.fetch_cloud_skill(skill_id)
             except CloudError:
@@ -942,12 +754,12 @@ class OpenSpaceClient:
             metadata = detail.get("authored_metadata")
             if not isinstance(metadata, dict):
                 metadata = {}
+
             name = (
                 detail.get("title")
                 or metadata.get("name")
                 or candidate.get("title")
                 or candidate.get("skill_name")
-                or preview.get("skill_name")
                 or skill_id
             )
             description = (
@@ -955,28 +767,23 @@ class OpenSpaceClient:
                 or metadata.get("description")
                 or candidate.get("summary")
                 or candidate.get("snippet")
-                or candidate.get("preview_text")
-                or preview.get("preview_text")
-                or preview.get("summary_line")
                 or ""
             )
             effective_visibility = (
                 detail.get("effective_visibility")
                 or candidate.get("effective_visibility")
-                or preview.get("display_scope")
+                or candidate.get("access_mode")
                 or "public"
             )
             package_id = (
                 detail.get("package_id")
                 or candidate.get("package_id")
-                or candidate.get("root_package_id")
-                or preview.get("package_id", "")
+                or root_package_id
             )
             package_path = (
                 detail.get("package_path")
                 or candidate.get("package_path")
-                or candidate.get("root_package_path")
-                or preview.get("package_path", "")
+                or root_package_path
             )
             raw_score = candidate.get("score")
             raw_rank = candidate.get("rank")
@@ -984,10 +791,9 @@ class OpenSpaceClient:
                 search_rank = float(raw_score)
             elif isinstance(raw_rank, int) and raw_rank > 0:
                 search_rank = 1.0 / raw_rank
-            elif isinstance(candidate.get("_package_recall_score"), (int, float)):
-                search_rank = float(candidate["_package_recall_score"])
             else:
-                search_rank = 1.0 / (len(rows) + 1)
+                search_rank = 1.0 / (index + 1)
+
             rows.append({
                 "cloud_skill_id": skill_id,
                 "name": name,
@@ -1000,105 +806,27 @@ class OpenSpaceClient:
                 "origin": metadata.get("origin_type") or metadata.get("origin") or "",
                 "created_by": metadata.get("created_by") or "",
                 "search_rank": search_rank,
-                "source_api": (
-                    "v2/package-skill-search"
-                    if candidate.get("skill_search_id")
-                    else candidate.get("source_api") or "v2/search-preview"
-                ),
-                "snippet": candidate.get("snippet") or candidate.get("preview_text") or "",
-                "skill_search_id": candidate.get("skill_search_id", ""),
+                "source_api": "v2/skills/search",
+                "snippet": candidate.get("snippet") or "",
+                "skill_search_id": skill_search_id,
                 "match_mode": candidate.get("match_mode", ""),
-                "served_mode": candidate.get("served_mode", ""),
-                "semantic_status": candidate.get("semantic_status", ""),
-                "fallback_reason": candidate.get("fallback_reason") or "",
+                "served_mode": candidate.get("served_mode", served_mode),
+                "requested_mode": requested_mode,
+                "semantic_status": candidate.get("semantic_status", semantic_status),
+                "fallback_reason": candidate.get("fallback_reason") or fallback_reason,
                 "artifact_state": detail.get("artifact_state") or candidate.get("artifact_state", ""),
                 "downloadable": detail.get("downloadable", candidate.get("downloadable")),
                 "metadata_only": detail.get("metadata_only", candidate.get("metadata_only")),
             })
-
-        for skill_id, candidate in sorted(candidates.items(), key=candidate_sort_key):
-            add_skill_row(skill_id, candidate)
-            if len(rows) >= skill_limit:
+            if len(rows) >= limit:
                 break
         return rows
-
-    @staticmethod
-    def _dedupe_ranked_packages(
-        packages: List[Dict[str, Any]],
-        *,
-        max_roots: int,
-    ) -> List[Dict[str, Any]]:
-        """Return top recall packages by server order with exact-id dedupe.
-
-        This is used for ``POST /packages/pull`` immediately after recall so
-        the client can inspect cloud projections and record package-selection
-        telemetry before narrowing to concrete skills.
-        """
-
-        deduped: list[Dict[str, Any]] = []
-        seen_ids: set[str] = set()
-        for package in packages:
-            package_id = str(package.get("package_id") or "")
-            if not package_id or package_id in seen_ids:
-                continue
-            seen_ids.add(package_id)
-            deduped.append(package)
-            if len(deduped) >= max_roots:
-                break
-        return deduped
-
-    @staticmethod
-    def _select_skill_search_packages(
-        packages: List[Dict[str, Any]],
-        *,
-        max_roots: int,
-    ) -> List[Dict[str, Any]]:
-        """Choose package roots for package-local skill search.
-
-        Recall can return both a matching regular package and its ancestors.
-        Searching every ancestor repeats the same subtree.  Prefer concrete
-        package hits, while keeping ancestor-only hits when no more specific
-        package is present.
-        """
-
-        deduped: list[Dict[str, Any]] = []
-        seen_ids: set[str] = set()
-        for package in packages:
-            package_id = str(package.get("package_id") or "")
-            if not package_id or package_id in seen_ids:
-                continue
-            seen_ids.add(package_id)
-            deduped.append(package)
-
-        path_segments = {
-            str(package.get("package_id") or ""): _package_path_segments(
-                str(package.get("package_path") or "")
-            )
-            for package in deduped
-        }
-        selected: list[Dict[str, Any]] = []
-        for package in deduped:
-            package_id = str(package.get("package_id") or "")
-            segments = path_segments.get(package_id) or ()
-            preview_entries = package.get("preview_entries") or []
-            has_preview = bool(preview_entries)
-            has_descendant = any(
-                other_id != package_id
-                and _is_ancestor_path(segments, other_segments)
-                for other_id, other_segments in path_segments.items()
-            )
-            if has_descendant and not has_preview:
-                continue
-            selected.append(package)
-            if len(selected) >= max_roots:
-                break
-        return selected
 
     def upload_skill_v2(
         self,
         skill_dir: Path,
         *,
-        visibility: str = "public",
+        visibility: str = "private",
         origin: str = "imported",
         parent_cloud_skill_ids: Optional[List[str]] = None,
         requested_package_id: str | None = None,

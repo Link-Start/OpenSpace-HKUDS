@@ -9,6 +9,8 @@ semantics.
 from __future__ import annotations
 
 import inspect
+import hashlib
+import json
 import shutil
 import uuid
 from dataclasses import dataclass, field, replace
@@ -28,6 +30,12 @@ from openspace.skill_engine.types import (
     SkillRecord,
 )
 from .audit import EvolutionActionRecord
+from .behavior_eval import (
+    SkillBehaviorEvalResult,
+    behavior_eval_feedback,
+    _replay_result_has_verified_executable_evidence,
+    _replay_task_result_failures,
+)
 from openspace.utils.logging import Logger
 
 logger = Logger.get_logger(__name__)
@@ -43,8 +51,24 @@ class EvolutionRunResult:
     admissions: list[Any] = field(default_factory=list)
     candidates: list[Any] = field(default_factory=list)
     actions: list[Any] = field(default_factory=list)
+    behavior_evals: list[SkillBehaviorEvalResult] = field(default_factory=list)
     evolved_skill_records: list[Any] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True, slots=True)
+class EvolutionMutationOutcome:
+    action: Any | None = None
+    candidate: Any | None = None
+    behavior_evals: list[SkillBehaviorEvalResult] = field(default_factory=list)
+    blocked_reason: str | None = None
+    errors: list[str] = field(default_factory=list)
+
+    @property
+    def committed_action(self) -> Any | None:
+        if self.action is None:
+            return None
+        return self.action
 
 
 class EvolutionEngine:
@@ -59,8 +83,10 @@ class EvolutionEngine:
         candidate_store: Any | None = None,
         authoring_backend: Any | None = None,
         validator: Any | None = None,
+        behavior_evaluator: Any | None = None,
         committer: Any | None = None,
         evolution_mode: str = "autonomous",
+        behavior_eval_max_revisions: int = 2,
     ) -> None:
         self.packet_builder = packet_builder
         self.decision_engine = decision_engine
@@ -68,8 +94,10 @@ class EvolutionEngine:
         self.candidate_store = candidate_store
         self.authoring_backend = authoring_backend
         self.validator = validator
+        self.behavior_evaluator = behavior_evaluator
         self.committer = committer
         self.evolution_mode = _normalize_evolution_mode(evolution_mode)
+        self.behavior_eval_max_revisions = max(0, int(behavior_eval_max_revisions))
 
     async def process_job(
         self,
@@ -96,6 +124,7 @@ class EvolutionEngine:
         admissions: list[Any] = []
         candidates: list[Any] = []
         actions: list[Any] = []
+        behavior_evals: list[SkillBehaviorEvalResult] = []
         evolved: list[Any] = []
         errors: list[str] = []
         packet: Any | None = None
@@ -170,16 +199,28 @@ class EvolutionEngine:
                 if mode == "fix_only" and outcome != "direct":
                     continue
 
-                action = await self._author_validate_commit(
+                mutation = await self._author_validate_commit(
                     decision,
                     admission,
                     packet,
                     job,
                 )
+                if mutation.candidate is not None:
+                    candidates.append(mutation.candidate)
+                behavior_evals.extend(mutation.behavior_evals)
+                if mutation.errors:
+                    errors.extend(mutation.errors)
+                action = mutation.committed_action
                 if action is None:
-                    errors.append(
-                        "direct action did not produce a committed action record"
-                    )
+                    if mutation.blocked_reason:
+                        logger.info(
+                            "Evolution direct action blocked before commit: %s",
+                            mutation.blocked_reason,
+                        )
+                    else:
+                        errors.append(
+                            "direct action did not produce a committed action record"
+                        )
                     continue
                 actions.append(action)
                 commit_status = _commit_status(action)
@@ -209,6 +250,7 @@ class EvolutionEngine:
                 admissions=admissions,
                 candidates=candidates,
                 actions=actions,
+                behavior_evals=behavior_evals,
                 evolved_skill_records=evolved,
                 errors=errors,
             )
@@ -224,6 +266,7 @@ class EvolutionEngine:
                 admissions=admissions,
                 candidates=candidates,
                 actions=actions,
+                behavior_evals=behavior_evals,
                 evolved_skill_records=evolved,
                 errors=errors,
             )
@@ -369,7 +412,7 @@ class EvolutionEngine:
         action_id = _action_id(action)
         if not action_id:
             return []
-        candidate_ids = _candidate_ids_from_job_and_packet(job, packet)
+        candidate_ids = _explicit_promoted_candidate_ids(job, action)
         if not candidate_ids:
             return []
         marker = getattr(store, "mark_promoted", None)
@@ -406,7 +449,7 @@ class EvolutionEngine:
         recorder = getattr(store, "record_recheck_result", None)
         if store is None or not callable(recorder):
             return
-        candidate_ids = _candidate_ids_from_job_and_packet(job, packet)
+        candidate_ids = _explicit_candidate_ids_from_job(job)
         if not candidate_ids:
             return
         payload = _candidate_recheck_result_payload(result, mode=mode)
@@ -435,42 +478,69 @@ class EvolutionEngine:
         admission: Any,
         packet: Any,
         job: Any,
-    ) -> Any:
+    ) -> EvolutionMutationOutcome:
         authoring = self.authoring_backend
         if authoring is None:
             logger.warning("Evolution authoring skipped: no authoring backend available")
-            return None
+            return EvolutionMutationOutcome(errors=["missing_authoring_backend"])
         method = getattr(authoring, "author_from_action_packet", None)
         if not callable(method):
             logger.warning(
                 "Evolution authoring backend does not expose "
                 "author_from_action_packet; skipping mutation"
             )
-            return None
+            return EvolutionMutationOutcome(errors=["invalid_authoring_backend"])
 
         action_packet = await self._build_action_packet(decision, admission, packet)
         if action_packet is None:
-            return None
+            return EvolutionMutationOutcome(errors=["missing_action_packet"])
 
-        authoring_result = await _maybe_await(method(action_packet))
-        if authoring_result is None:
-            return None
-        if not _authoring_staged(authoring_result):
-            return None
+        behavior_evals: list[SkillBehaviorEvalResult] = []
+        eval_feedback: Any | None = None
+        previous_authoring: Any | None = None
+        last_validation: Any | None = None
+        last_authoring: Any | None = None
+        for attempt in range(self.behavior_eval_max_revisions + 1):
+            authoring_result = await self._call_authoring_backend(
+                method,
+                action_packet,
+                eval_feedback=eval_feedback,
+                previous_authoring=previous_authoring,
+            )
+            last_authoring = authoring_result
+            if authoring_result is None:
+                return EvolutionMutationOutcome(
+                    behavior_evals=behavior_evals,
+                    errors=["authoring_returned_none"],
+                )
+            if not _authoring_staged(authoring_result):
+                errors = ["authoring_not_staged"]
+                failure_reason = _authoring_failure_reason(authoring_result)
+                if failure_reason:
+                    errors.append(f"authoring_failure:{failure_reason}")
+                return EvolutionMutationOutcome(
+                    behavior_evals=behavior_evals,
+                    errors=errors,
+                )
 
-        validator = self.validator
-        validation_result = None
-        if validator is None:
-            logger.warning("Evolution validation skipped: no validator available")
-            return None
-        if validator is not None:
+            validator = self.validator
+            validation_result = None
+            if validator is None:
+                logger.warning("Evolution validation skipped: no validator available")
+                return EvolutionMutationOutcome(
+                    behavior_evals=behavior_evals,
+                    errors=["missing_validator"],
+                )
             validator_packet = await self._build_validator_packet(
                 authoring_result,
                 action_packet,
             )
             if validator_packet is None:
                 logger.warning("Evolution validation skipped: no validator packet available")
-                return None
+                return EvolutionMutationOutcome(
+                    behavior_evals=behavior_evals,
+                    errors=["missing_validator_packet"],
+                )
             validation_result = await self._call_validator(
                 validator,
                 authoring_result,
@@ -479,15 +549,138 @@ class EvolutionEngine:
                 admission,
                 job,
             )
+            last_validation = validation_result
             if not _validation_passed(validation_result):
-                return None
+                return EvolutionMutationOutcome(
+                    behavior_evals=behavior_evals,
+                    blocked_reason="validation_failed",
+                )
 
-        committer = self.committer
-        if committer is None:
-            logger.warning("Evolution commit skipped: no committer available")
+            behavior_result = await self._run_behavior_eval(
+                authoring_result,
+                validation_result,
+                decision,
+                admission,
+                action_packet,
+            )
+            if behavior_result is not None:
+                behavior_evals.append(behavior_result)
+                if not behavior_result.passed:
+                    if attempt < self.behavior_eval_max_revisions:
+                        eval_feedback = behavior_eval_feedback(behavior_result)
+                        previous_authoring = authoring_result
+                        continue
+                    candidate = await self._create_candidate(
+                        decision,
+                        admission,
+                        packet,
+                        job,
+                        reason=_behavior_eval_candidate_reason(behavior_result),
+                    )
+                    return EvolutionMutationOutcome(
+                        candidate=candidate,
+                        behavior_evals=behavior_evals,
+                        blocked_reason=_behavior_eval_blocked_reason(behavior_result),
+                    )
+                validation_result = _attach_behavior_eval_ref(
+                    validation_result,
+                    behavior_result,
+                )
+            else:
+                candidate = await self._create_candidate(
+                    decision,
+                    admission,
+                    packet,
+                    job,
+                    reason="missing_behavior_eval",
+                )
+                return EvolutionMutationOutcome(
+                    candidate=candidate,
+                    behavior_evals=behavior_evals,
+                    blocked_reason="missing_behavior_eval",
+                    errors=["missing_behavior_eval"],
+                )
+
+            committer = self.committer
+            if committer is None:
+                logger.warning("Evolution commit skipped: no committer available")
+                return EvolutionMutationOutcome(
+                    behavior_evals=behavior_evals,
+                    errors=["missing_committer"],
+                )
+            for name in ("commit", "apply"):
+                commit_method = getattr(committer, name, None)
+                if callable(commit_method):
+                    action = await _maybe_await(
+                        commit_method(
+                            authoring_result,
+                            validation_result,
+                            decision,
+                            admission,
+                            action_packet,
+                        )
+                    )
+                    return EvolutionMutationOutcome(
+                        action=action,
+                        behavior_evals=behavior_evals,
+                    )
+            if callable(committer):
+                action = await _maybe_await(
+                    committer(
+                        authoring_result,
+                        validation_result,
+                        decision,
+                        admission,
+                        action_packet,
+                    )
+                )
+                return EvolutionMutationOutcome(
+                    action=action,
+                    behavior_evals=behavior_evals,
+                )
+            return EvolutionMutationOutcome(
+                action=authoring_result,
+                behavior_evals=behavior_evals,
+            )
+        return EvolutionMutationOutcome(
+            behavior_evals=behavior_evals,
+            blocked_reason="behavior_eval_revision_exhausted",
+            errors=[] if last_authoring is not None and last_validation is not None else [
+                "mutation_loop_exhausted_without_result"
+            ],
+        )
+
+    async def _call_authoring_backend(
+        self,
+        method: Any,
+        action_packet: Any,
+        *,
+        eval_feedback: Any | None,
+        previous_authoring: Any | None,
+    ) -> Any:
+        kwargs: dict[str, Any] = {}
+        if eval_feedback is not None and _accepts_keyword(method, "eval_feedback"):
+            kwargs["eval_feedback"] = eval_feedback
+        if previous_authoring is not None and _accepts_keyword(method, "previous_authoring"):
+            kwargs["previous_authoring"] = previous_authoring
+        if kwargs:
+            return await _maybe_await(method(action_packet, **kwargs))
+        return await _maybe_await(method(action_packet))
+
+    async def _run_behavior_eval(
+        self,
+        authoring_result: Any,
+        validation_result: Any,
+        decision: Any,
+        admission: Any,
+        action_packet: Any,
+    ) -> SkillBehaviorEvalResult | None:
+        evaluator = self.behavior_evaluator
+        if evaluator is None:
+            logger.warning("Behavior eval skipped: no behavior evaluator available")
             return None
-        for name in ("commit", "apply"):
-            method = getattr(committer, name, None)
+        for name in ("evaluate", "run"):
+            method = getattr(evaluator, name, None)
             if callable(method):
                 return await _maybe_await(
                     method(
@@ -498,9 +691,9 @@ class EvolutionEngine:
                         action_packet,
                     )
                 )
-        if callable(committer):
+        if callable(evaluator):
             return await _maybe_await(
-                committer(
+                evaluator(
                     authoring_result,
                     validation_result,
                     decision,
@@ -508,7 +701,7 @@ class EvolutionEngine:
                     action_packet,
                 )
             )
-        return authoring_result
+        return None
 
     async def _build_action_packet(
         self,
@@ -618,7 +811,9 @@ class EvolutionCommitter:
         self._check_preconditions(
             authoring=authoring,
             validation=validation,
+            decision=decision,
             admission=admission,
+            action_packet=action_packet,
             action_type=action_type,
         )
         staged = _attr(authoring, "staged_edit")
@@ -842,7 +1037,9 @@ class EvolutionCommitter:
         *,
         authoring: Any,
         validation: Any,
+        decision: Any | None = None,
         admission: Any,
+        action_packet: Any | None = None,
         action_type: str,
     ) -> None:
         if str(_attr(authoring, "status") or "").strip().lower() != "staged":
@@ -853,6 +1050,14 @@ class EvolutionCommitter:
             raise ValueError("admission result is not direct")
         if action_type not in {"FIX", "DERIVED", "CAPTURED"}:
             raise ValueError(f"unsupported commit action type: {action_type or '(missing)'}")
+        _require_approved_behavior_eval(
+            self.evidence_store,
+            authoring=authoring,
+            validation=validation,
+            decision=decision,
+            action_packet=action_packet,
+            action_type=action_type,
+        )
 
     def _build_skill_record(
         self,
@@ -892,6 +1097,14 @@ class EvolutionCommitter:
         )
         change_summary = _change_summary(staged, decision, action)
         provenance_refs = _dedupe_strs(evidence_refs)
+        content_hash = _content_snapshot_hash(snapshot)
+        revision_metadata = _revision_metadata(
+            evidence_store=self.evidence_store,
+            evidence_refs=provenance_refs,
+            revision_id=skill_id,
+            parent_revision_ids=parent_skill_ids,
+            content_hash=content_hash,
+        )
 
         if action_type == "FIX":
             assert first_parent is not None
@@ -950,14 +1163,18 @@ class EvolutionCommitter:
             creator_id=creator_id,
             lineage=SkillLineage(
                 origin=origin,
+                revision_id=skill_id,
                 generation=generation,
                 parent_skill_ids=list(parent_skill_ids),
+                parent_revision_ids=list(parent_skill_ids),
                 source_task_id=source_task_id,
                 change_summary=change_summary,
+                content_hash=content_hash,
                 content_diff=content_diff,
                 content_snapshot=snapshot,
                 evolution_action_id=action.action_id,
                 provenance_refs=provenance_refs,
+                revision_metadata=revision_metadata,
                 created_by=str(_attr(authoring, "model") or ""),
             ),
             tool_dependencies=tool_dependencies,
@@ -1268,6 +1485,69 @@ def _change_summary(staged: Any, decision: Any, action: EvolutionActionRecord) -
     return f"{summary}\n\nAudit: {audit}" if summary else f"Audit: {audit}"
 
 
+def _content_snapshot_hash(snapshot: Mapping[str, str]) -> str:
+    payload = json.dumps(
+        {str(key): str(value) for key, value in sorted(snapshot.items())},
+        sort_keys=True,
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _revision_metadata(
+    *,
+    evidence_store: Any,
+    evidence_refs: list[str],
+    revision_id: str,
+    parent_revision_ids: list[str],
+    content_hash: str,
+) -> dict[str, Any]:
+    metadata: dict[str, Any] = {
+        "revision_id": revision_id,
+        "parent_revision_ids": list(parent_revision_ids),
+        "content_hash": content_hash,
+        "behavior_eval_refs": [
+            ref for ref in evidence_refs if str(ref).startswith("behavior_eval:")
+        ],
+    }
+    loader = getattr(evidence_store, "load_behavior_eval", None)
+    if not callable(loader):
+        return metadata
+    evals: list[dict[str, Any]] = []
+    for ref in metadata["behavior_eval_refs"]:
+        eval_id = str(ref).split(":", 1)[1]
+        try:
+            result = loader(eval_id)
+        except Exception:
+            logger.debug("Failed to load behavior eval for revision metadata", exc_info=True)
+            continue
+        if result is None:
+            continue
+        replay = getattr(result, "replay_eval", None)
+        evals.append(
+            {
+                "eval_id": getattr(result, "eval_id", eval_id),
+                "outcome": getattr(result, "outcome", ""),
+                "replay_run_id": getattr(replay, "replay_run_id", ""),
+                "sandbox_run_id": getattr(replay, "sandbox_run_id", ""),
+                "judge_result_id": getattr(replay, "judge_result_id", ""),
+                "baseline_revision_set": list(
+                    getattr(replay, "baseline_revision_set", []) or []
+                ),
+                "candidate_revision_set": list(
+                    getattr(replay, "candidate_revision_set", []) or []
+                ),
+                "baseline_score": getattr(replay, "baseline_score", None),
+                "candidate_score": getattr(replay, "candidate_score", None),
+                "artifact_refs": list(getattr(replay, "artifact_refs", []) or []),
+            }
+        )
+    if evals:
+        metadata["behavior_evals"] = evals
+        metadata["latest_behavior_eval"] = evals[-1]
+    return metadata
+
+
 def _decision_category(decision: Any) -> SkillCategory | None:
     value = _attr(decision, "category")
     if not value:
@@ -1312,6 +1592,20 @@ def _none_or_str(value: Any) -> str | None:
         return None
     text = str(value)
     return text if text else None
+
+
+def _strict_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in {0, 1}:
+        return bool(value)
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"true", "1", "yes", "y"}:
+            return True
+        if text in {"false", "0", "no", "n"}:
+            return False
+    return None
 
 
 def _str_list(value: Any) -> list[str]:
@@ -1369,7 +1663,226 @@ def _validation_passed(validation: Any) -> bool:
     if raw is None:
         raw = getattr(validation, "status", None) or _mapping_get(validation, "status")
         return str(raw).strip().lower() in {"passed", "success", "ok"}
-    return bool(raw)
+    return _strict_bool(raw) is True
+
+
+def _attach_behavior_eval_ref(
+    validation: Any,
+    behavior_result: SkillBehaviorEvalResult,
+) -> Any:
+    if validation is None:
+        return validation
+    ref_id = behavior_result.ref_id
+    current = _str_list(
+        getattr(validation, "provenance_refs", None)
+        or _mapping_get(validation, "provenance_refs")
+    )
+    refs = _dedupe_strs([*current, ref_id])
+    try:
+        return replace(validation, provenance_refs=refs)
+    except Exception:
+        if isinstance(validation, dict):
+            updated = dict(validation)
+            updated["provenance_refs"] = refs
+            return updated
+        if hasattr(validation, "provenance_refs"):
+            try:
+                setattr(validation, "provenance_refs", refs)
+                return validation
+            except Exception:
+                logger.debug(
+                    "Failed to attach behavior eval ref to mutable validation object",
+                    exc_info=True,
+                )
+    return validation
+
+
+def _has_behavior_eval_ref(validation: Any, staged: Any = None) -> bool:
+    del staged
+    return bool(_validation_behavior_eval_refs(validation))
+
+
+def _require_approved_behavior_eval(
+    evidence_store: Any,
+    *,
+    authoring: Any,
+    validation: Any,
+    decision: Any | None,
+    action_packet: Any | None,
+    action_type: str,
+) -> SkillBehaviorEvalResult:
+    refs = _validation_behavior_eval_refs(validation)
+    if not refs:
+        raise ValueError("commit requires approved behavior eval provenance ref")
+    loader = getattr(evidence_store, "load_behavior_eval", None)
+    if not callable(loader):
+        raise ValueError("commit requires behavior eval evidence store lookup")
+
+    checked_failures: list[str] = []
+    for ref in refs:
+        eval_id = _behavior_eval_id_from_ref(ref)
+        if not eval_id:
+            continue
+        try:
+            result = loader(eval_id)
+        except Exception as exc:
+            checked_failures.append(f"{ref}:load_failed:{str(exc)[:120]}")
+            logger.debug("Failed to load behavior eval ref %s", ref, exc_info=True)
+            continue
+        failures = _behavior_eval_commit_gate_failures(
+            result,
+            evidence_store=evidence_store,
+            authoring=authoring,
+            validation=validation,
+            decision=decision,
+            action_packet=action_packet,
+            action_type=action_type,
+        )
+        if not failures:
+            return result
+        checked_failures.append(f"{ref}:{','.join(failures[:4])}")
+
+    detail = f" ({'; '.join(checked_failures[:3])})" if checked_failures else ""
+    raise ValueError(f"commit requires approved behavior eval provenance ref{detail}")
+
+
+def _validation_behavior_eval_refs(validation: Any) -> list[str]:
+    refs = _str_list(
+        getattr(validation, "provenance_refs", None)
+        or _mapping_get(validation, "provenance_refs")
+    )
+    return [
+        ref
+        for ref in refs
+        if _behavior_eval_id_from_ref(ref)
+    ]
+
+
+def _behavior_eval_id_from_ref(ref: Any) -> str:
+    text = str(ref or "").strip()
+    if not text.startswith("behavior_eval:"):
+        return ""
+    eval_id = text.split(":", 1)[1].strip()
+    return eval_id if eval_id else ""
+
+
+def _behavior_eval_commit_gate_failures(
+    result: Any,
+    *,
+    evidence_store: Any | None = None,
+    authoring: Any,
+    validation: Any,
+    decision: Any | None,
+    action_packet: Any | None,
+    action_type: str,
+) -> list[str]:
+    if result is None:
+        return ["missing_behavior_eval_result"]
+    failures: list[str] = []
+    if str(_attr(result, "outcome") or "").strip().lower() != "approve":
+        failures.append("behavior_eval_not_approved")
+    behavior_failures = _str_list(_attr(result, "failures"))
+    if behavior_failures:
+        failures.extend(f"behavior_eval_failure:{item}" for item in behavior_failures)
+    optional_replay_allowed = _behavior_eval_allows_optional_replay(result)
+    replay = _attr(result, "replay_eval")
+    if not replay:
+        if optional_replay_allowed:
+            pass
+        else:
+            failures.append("missing_replay_eval")
+    elif optional_replay_allowed:
+        replay_mapping = _replay_eval_gate_mapping(replay)
+        failures.extend(_replay_task_result_failures(replay_mapping))
+    else:
+        if _strict_bool(_attr(replay, "attempted")) is not True:
+            failures.append("replay_eval_not_attempted")
+        if _strict_bool(_attr(replay, "passed")) is not True:
+            failures.append("replay_eval_not_passed")
+        replay_mapping = _replay_eval_gate_mapping(replay)
+        if not _replay_result_has_verified_executable_evidence(
+            replay_mapping,
+            evidence_store,
+        ):
+            failures.append("missing_executable_eval_evidence")
+        failures.extend(_replay_task_result_failures(replay_mapping))
+
+    expected = {
+        "authoring_id": str(_attr(authoring, "authoring_id") or ""),
+        "validation_id": str(_attr(validation, "validation_id") or ""),
+        "decision_id": str(
+            _attr(decision, "decision_id")
+            or _attr(authoring, "decision_id")
+            or ""
+        ),
+        "packet_id": str(_attr(action_packet, "packet_id") or ""),
+        "action_type": str(action_type or "").strip().upper(),
+    }
+    for field_name, expected_value in expected.items():
+        if not expected_value:
+            failures.append(f"missing_behavior_eval_binding:{field_name}")
+            continue
+        actual = str(_attr(result, field_name) or "").strip()
+        if field_name == "action_type":
+            actual = actual.upper()
+        if actual != expected_value:
+            failures.append(f"behavior_eval_binding_mismatch:{field_name}")
+    return _dedupe_strs(failures)
+
+
+def _behavior_eval_allows_optional_replay(result: Any) -> bool:
+    warnings = _str_list(_attr(result, "warnings"))
+    if any(str(item).startswith("optional_replay_eval_") for item in warnings):
+        return True
+    replay = _attr(result, "replay_eval")
+    if not replay:
+        return False
+    replay_warnings = _str_list(_attr(replay, "warnings"))
+    return any(
+        str(item).startswith("optional_replay_eval_") for item in replay_warnings
+    )
+
+
+def _replay_eval_gate_mapping(replay: Any) -> dict[str, Any]:
+    if hasattr(replay, "to_dict") and callable(replay.to_dict):
+        data = replay.to_dict()
+        if isinstance(data, Mapping):
+            return dict(data)
+    if isinstance(replay, Mapping):
+        return dict(replay)
+    result: dict[str, Any] = {}
+    for key in (
+        "attempted",
+        "passed",
+        "runner",
+        "replay_run_id",
+        "sandbox_run_id",
+        "judge_result_id",
+        "baseline_revision_set",
+        "candidate_revision_set",
+        "baseline_score",
+        "candidate_score",
+        "artifact_refs",
+        "details",
+        "failures",
+        "warnings",
+    ):
+        value = _attr(replay, key)
+        if value is not None:
+            result[key] = value
+    return result
+
+
+def _behavior_eval_blocked_reason(result: SkillBehaviorEvalResult) -> str:
+    if result.failures:
+        return f"behavior_eval_failed:{result.failures[0]}"
+    return f"behavior_eval_{result.outcome}"
+
+
+def _behavior_eval_candidate_reason(result: SkillBehaviorEvalResult) -> str:
+    if result.failures:
+        return f"behavior_eval_failed:{result.failures[0]}"
+    return "behavior_eval_failed"
 
 
 def _authoring_staged(authoring_result: Any) -> bool:
@@ -1379,6 +1892,14 @@ def _authoring_staged(authoring_result: Any) -> bool:
     if status is None:
         return False
     return str(status).strip().lower() == "staged"
+
+
+def _authoring_failure_reason(authoring_result: Any) -> str | None:
+    for key in ("failure_reason", "error", "message"):
+        raw = getattr(authoring_result, key, None) or _mapping_get(authoring_result, key)
+        if raw:
+            return str(raw).strip()[:500]
+    return None
 
 
 def _extract_skill_record(action: Any) -> Any | None:
@@ -1400,41 +1921,39 @@ def _action_id(action: Any) -> str:
     return str(raw or "").strip()
 
 
-def _candidate_ids_from_job_and_packet(job: Any, packet: Any) -> list[str]:
+def _explicit_promoted_candidate_ids(job: Any, action: Any) -> list[str]:
+    ids = _explicit_candidate_ids_from_job(job)
+
+    for key in (
+        "candidate_id",
+        "consumed_candidate_id",
+        "promoted_candidate_id",
+        "evolution_candidate_id",
+    ):
+        value = str(getattr(action, key, None) or _mapping_get(action, key) or "")
+        if value:
+            ids.append(value)
+
+    for key in ("candidate_ids", "consumed_candidate_ids", "promoted_candidate_ids"):
+        ids.extend(
+            _str_list(getattr(action, key, None) or _mapping_get(action, key))
+        )
+    return _dedupe_strs(ids)
+
+
+def _explicit_candidate_ids_from_job(job: Any) -> list[str]:
     ids: list[str] = []
     for tag in _str_list(
         getattr(job, "reason_tags", None) or _mapping_get(job, "reason_tags")
     ):
         if tag.startswith("candidate_id:"):
             ids.append(tag.split(":", 1)[1])
-
-    selected_refs = getattr(packet, "selected_refs", None) or _mapping_get(
-        packet,
-        "selected_refs",
-    )
-    if isinstance(selected_refs, Mapping):
-        for refs in selected_refs.values():
-            for ref in refs or []:
-                ref_type = str(
-                    getattr(ref, "ref_type", None) or _mapping_get(ref, "ref_type") or ""
-                )
-                if ref_type != "evolution_candidate_ref":
-                    continue
-                metadata = getattr(ref, "metadata", None) or _mapping_get(
-                    ref,
-                    "metadata",
-                )
-                if isinstance(metadata, Mapping):
-                    candidate_id = str(metadata.get("candidate_id") or "")
-                    if candidate_id:
-                        ids.append(candidate_id)
-                        continue
-                ref_id = str(
-                    getattr(ref, "ref_id", None) or _mapping_get(ref, "ref_id") or ""
-                )
-                if ref_id.startswith("candidate:"):
-                    ids.append(ref_id.split(":", 1)[1])
     return _dedupe_strs(ids)
+
+
+def _candidate_ids_from_job_and_packet(job: Any, packet: Any) -> list[str]:
+    del packet
+    return _explicit_candidate_ids_from_job(job)
 
 
 def _candidate_recheck_result_payload(
@@ -1476,6 +1995,16 @@ def _candidate_recheck_result_payload(
             for item in result.actions
             if _attr(item, "commit_status")
         ],
+        "behavior_eval_ids": [
+            str(_attr(item, "eval_id") or "")
+            for item in result.behavior_evals
+            if _attr(item, "eval_id")
+        ],
+        "behavior_eval_outcomes": [
+            str(_attr(item, "outcome") or "")
+            for item in result.behavior_evals
+            if _attr(item, "outcome")
+        ],
         "errors": [str(item) for item in result.errors],
         "checked_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -1490,12 +2019,17 @@ def _candidate_recheck_blocked_reason(
         return None
     if any(_commit_status(action) == "committing" for action in result.actions):
         return "commit_needs_recovery"
-    if result.errors:
-        return "engine_failed"
     for candidate in result.candidates:
-        reason = _none_or_str(_attr(candidate, "blocked_reason"))
+        reason = _none_or_str(_attr(candidate, "blocked_reason")) or _none_or_str(
+            _attr(candidate, "reason")
+        )
         if reason:
             return reason
+    error_reason = _candidate_recheck_error_reason(result.errors)
+    if error_reason:
+        return error_reason
+    if result.errors:
+        return "engine_failed"
     for admission in result.admissions:
         outcome = str(_attr(admission, "outcome") or "").lower()
         if outcome == "candidate":
@@ -1540,6 +2074,22 @@ def _candidate_admission_reason(admission: Any) -> str | None:
     return None
 
 
+def _candidate_recheck_error_reason(errors: list[Any]) -> str | None:
+    normalized = [str(error or "").strip() for error in errors if str(error or "").strip()]
+    if "missing_behavior_eval" in normalized:
+        return "missing_behavior_eval"
+    for error in normalized:
+        if error.startswith("behavior_eval_failed:"):
+            return error
+        if error in {
+            "missing_behavior_eval",
+            "missing_behavior_evaluator",
+            "missing_required_replay_runner",
+        }:
+            return error
+    return None
+
+
 def _candidate_recheck_needed_evidence(result: EvolutionRunResult) -> list[str]:
     for candidate in result.candidates:
         needed = _str_list(_attr(candidate, "needed_evidence"))
@@ -1564,6 +2114,14 @@ def _candidate_recheck_needed_evidence(result: EvolutionRunResult) -> list[str]:
                 needed.append("primary_runtime_or_transcript_evidence")
             elif lower.startswith("missing_") or lower.startswith("missing_ref:"):
                 needed.append(str(tag))
+    for error in result.errors:
+        lower = str(error or "").strip().lower()
+        if lower == "missing_behavior_eval":
+            needed.append("behavior_eval_result")
+        elif lower == "missing_behavior_evaluator":
+            needed.append("behavior_evaluator")
+        elif lower == "missing_required_replay_runner":
+            needed.append("replay_runner")
     return _dedupe_strs(needed)
 
 

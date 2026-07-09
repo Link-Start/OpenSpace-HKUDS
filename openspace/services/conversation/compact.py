@@ -636,7 +636,7 @@ def format_compact_summary(summary: str) -> str:
         content = (match.group(1) or "").strip()
         formatted = re.sub(
             r"<summary>[\s\S]*?</summary>",
-            f"Summary:\n{content}",
+            lambda _match: f"Summary:\n{content}",
             formatted,
         )
 

@@ -571,7 +571,12 @@ class GroundingAgent(BaseAgent):
                 if context.get("task_id") is not None
                 else None
             ),
-            task_description=str(context.get("instruction") or ""),
+            task_description=str(
+                context.get("task_query")
+                or context.get("tool_retrieval_query")
+                or context.get("instruction")
+                or ""
+            ),
             current_iteration=int(context.get("current_iteration") or 0),
             max_iterations=int(context.get("max_iterations") or self._max_iterations),
             agent_definitions=context.get("agent_definitions"),
@@ -1114,7 +1119,11 @@ class GroundingAgent(BaseAgent):
         ):
             effective_stop_reason = "model_error"
 
-        is_success = effective_stop_reason in ("completed", "stop_hook_prevented")
+        is_success = effective_stop_reason in (
+            "completed",
+            "stop_hook_prevented",
+            "bench_finalize_budget",
+        )
 
         skill_ids = self._extract_skill_ids_from_messages(messages)
 

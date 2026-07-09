@@ -211,6 +211,28 @@ CREATE TABLE IF NOT EXISTS validation_results (
 CREATE INDEX IF NOT EXISTS idx_validation_results_authoring
   ON validation_results(authoring_id, decision_id, checked_at);
 
+CREATE TABLE IF NOT EXISTS behavior_eval_results (
+    eval_id TEXT PRIMARY KEY,
+    authoring_id TEXT NOT NULL,
+    validation_id TEXT NOT NULL,
+    decision_id TEXT NOT NULL,
+    packet_id TEXT NOT NULL,
+    action_type TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    failures_json TEXT NOT NULL DEFAULT '[]',
+    warnings_json TEXT NOT NULL DEFAULT '[]',
+    contract_eval_json TEXT NOT NULL DEFAULT '{}',
+    routing_eval_json TEXT NOT NULL DEFAULT '{}',
+    trigger_eval_json TEXT NOT NULL DEFAULT '{}',
+    replay_eval_json TEXT NOT NULL DEFAULT '{}',
+    contract_snapshot_json TEXT NOT NULL DEFAULT '{}',
+    checked_at TEXT NOT NULL,
+    checked_by TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_behavior_eval_results_authoring
+  ON behavior_eval_results(authoring_id, validation_id, checked_at);
+
 CREATE TABLE IF NOT EXISTS evolution_candidates (
     candidate_id TEXT PRIMARY KEY,
     proposed_action TEXT NOT NULL,
@@ -347,6 +369,16 @@ class EvidenceStore:
                 "resource_ref_observations",
                 "raw_backrefs_json",
                 "TEXT DEFAULT '[]'",
+            )
+            self._ensure_column_locked(
+                "behavior_eval_results",
+                "contract_eval_json",
+                "TEXT NOT NULL DEFAULT '{}'",
+            )
+            self._ensure_column_locked(
+                "behavior_eval_results",
+                "routing_eval_json",
+                "TEXT NOT NULL DEFAULT '{}'",
             )
             self._conn.commit()
 
@@ -1070,6 +1102,158 @@ class EvidenceStore:
                 provenance_refs=_json_list(row["provenance_refs_json"]),
                 checked_at=str(row["checked_at"]),
                 checked_by=str(row["checked_by"]),
+            )
+
+    def persist_behavior_eval(self, result: Any) -> None:
+        """Persist a behavior-evaluation gate result and index its ref."""
+
+        eval_id = str(getattr(result, "eval_id", "") or "")
+        if not eval_id:
+            raise ValueError("SkillBehaviorEvalResult.eval_id is required")
+        authoring_id = str(getattr(result, "authoring_id", "") or "")
+        validation_id = str(getattr(result, "validation_id", "") or "")
+        decision_id = str(getattr(result, "decision_id", "") or "")
+        packet_id = str(getattr(result, "packet_id", "") or "")
+        action_type = str(getattr(result, "action_type", "") or "")
+        outcome = str(getattr(result, "outcome", "") or "")
+        failures = _str_list(getattr(result, "failures", []))
+        warnings = _str_list(getattr(result, "warnings", []))
+        contract_eval = _to_dict(getattr(result, "contract_eval", None))
+        routing_eval = _to_dict(getattr(result, "routing_eval", None))
+        replay_eval = _to_dict(getattr(result, "replay_eval", None))
+        contract_snapshot = _dict_or_empty(getattr(result, "contract_snapshot", {}))
+        checked_at = str(getattr(result, "checked_at", "") or _utc_now())
+        checked_by = str(getattr(result, "checked_by", "") or "behavior_eval")
+
+        with self._mu:
+            self._ensure_open()
+            self._conn.execute(
+                """
+                INSERT OR REPLACE INTO behavior_eval_results (
+                    eval_id, authoring_id, validation_id, decision_id, packet_id,
+                    action_type, outcome, failures_json, warnings_json,
+                    contract_eval_json, routing_eval_json, trigger_eval_json,
+                    replay_eval_json, contract_snapshot_json, checked_at, checked_by
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    eval_id,
+                    authoring_id,
+                    validation_id,
+                    decision_id,
+                    packet_id,
+                    action_type,
+                    outcome,
+                    _json(failures),
+                    _json(warnings),
+                    _json(contract_eval),
+                    _json(routing_eval),
+                    _json(routing_eval),
+                    _json(replay_eval),
+                    _json(contract_snapshot),
+                    checked_at,
+                    checked_by,
+                ),
+            )
+            self._conn.commit()
+
+        packet = self.load_packet(packet_id) if packet_id else None
+        raw_backrefs = [
+            item
+            for item in dict.fromkeys(
+                [
+                    f"authoring:{authoring_id}" if authoring_id else "",
+                    f"validation:{validation_id}" if validation_id else "",
+                    f"decision:{decision_id}" if decision_id else "",
+                    f"packet:{packet_id}" if packet_id else "",
+                ]
+            )
+            if item
+        ]
+        ref = ResourceRef(
+            ref_id=f"behavior_eval:{eval_id}",
+            ref_type="behavior_eval_result_ref",
+            session_id=packet.scope.session_id if packet is not None else None,
+            task_id=packet.scope.task_id if packet is not None else None,
+            producer=checked_by,
+            created_at=checked_at,
+            reliability="derived",
+            role="derived",
+            preview=(
+                f"behavior_eval {outcome}"
+                + (f" failures={','.join(failures[:4])}" if failures else "")
+            )[:500],
+            metadata={
+                "eval_id": eval_id,
+                "authoring_id": authoring_id,
+                "validation_id": validation_id,
+                "decision_id": decision_id,
+                "packet_id": packet_id,
+                "action_type": action_type,
+                "outcome": outcome,
+                "failures": failures,
+                "warnings": warnings,
+                "contract_eval": contract_eval,
+                "routing_eval": routing_eval,
+                "replay_eval": replay_eval,
+            },
+            raw_backrefs=raw_backrefs,
+        )
+        event = EvidenceEvent.create(
+            event_id=f"evt_behavior_eval_{_digest(eval_id)}",
+            event_type="behavior_eval_result_persisted",
+            producer=checked_by,
+            created_at=checked_at,
+            session_id=ref.session_id,
+            task_id=ref.task_id,
+            idempotency_key=f"behavior_eval_result:{eval_id}",
+            derived_refs=[ref],
+            metadata={
+                "eval_id": eval_id,
+                "authoring_id": authoring_id,
+                "validation_id": validation_id,
+                "decision_id": decision_id,
+                "packet_id": packet_id,
+                "outcome": outcome,
+            },
+        )
+        self.ingest_event(event)
+
+    def load_behavior_eval(self, eval_id: str) -> Any:
+        with self._reader() as conn:
+            row = conn.execute(
+                "SELECT * FROM behavior_eval_results WHERE eval_id=?",
+                (eval_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            from openspace.skill_engine.evolution.behavior_eval import (
+                SkillBehaviorEvalResult,
+            )
+
+            return SkillBehaviorEvalResult.from_mapping(
+                {
+                    "eval_id": row["eval_id"],
+                    "authoring_id": row["authoring_id"],
+                    "validation_id": row["validation_id"],
+                    "decision_id": row["decision_id"],
+                    "packet_id": row["packet_id"],
+                    "action_type": row["action_type"],
+                    "outcome": row["outcome"],
+                    "failures": _json_list(row["failures_json"]),
+                    "warnings": _json_list(row["warnings_json"]),
+                    "contract_eval": _json_object(
+                        _row_value(row, "contract_eval_json")
+                    ),
+                    "routing_eval": _json_object(
+                        _row_value(row, "routing_eval_json")
+                    ),
+                    "trigger_eval": _json_object(row["trigger_eval_json"]),
+                    "replay_eval": _json_object(row["replay_eval_json"]),
+                    "contract_snapshot": _json_object(row["contract_snapshot_json"]),
+                    "checked_at": row["checked_at"],
+                    "checked_by": row["checked_by"],
+                }
             )
 
     def begin_action(
@@ -2120,6 +2304,22 @@ def _json_list(value: Any) -> list[str]:
     if not isinstance(parsed, list):
         return []
     return [str(item) for item in parsed if str(item)]
+
+
+def _to_dict(value: Any) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return dict(value)
+    to_dict = getattr(value, "to_dict", None)
+    if callable(to_dict):
+        data = to_dict()
+        return dict(data) if isinstance(data, dict) else {}
+    return {}
+
+
+def _dict_or_empty(value: Any) -> dict[str, Any]:
+    return dict(value) if isinstance(value, dict) else {}
 
 
 def _raw_backrefs_from_observation(observation: sqlite3.Row) -> list[str]:

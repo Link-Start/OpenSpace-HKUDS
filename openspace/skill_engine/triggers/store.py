@@ -271,6 +271,7 @@ class TriggerStore:
         worker_id: str | None = None,
         trigger_types: tuple[str, ...] | None = None,
         scope: EvidenceScope | None = None,
+        claim_statuses: tuple[str, ...] | None = None,
     ) -> list[TriggerJob]:
         """Atomically lock pending retryable jobs for a worker."""
 
@@ -281,15 +282,19 @@ class TriggerStore:
         requested_types = _normalize_trigger_types(trigger_types)
         if trigger_types and not requested_types:
             return []
+        requested_statuses = _normalize_claim_statuses(claim_statuses)
+        if claim_statuses and not requested_statuses:
+            return []
         with self._mu:
             self._ensure_open()
             self._conn.execute("BEGIN IMMEDIATE")
             try:
+                status_placeholders = ",".join("?" for _ in requested_statuses)
                 clauses = [
-                    "status IN ('pending', 'failed_retryable')",
+                    f"status IN ({status_placeholders})",
                     "scheduled_at <= ?",
                 ]
-                params: list[Any] = [now]
+                params: list[Any] = [*requested_statuses, now]
                 if requested_types:
                     placeholders = ",".join("?" for _ in requested_types)
                     clauses.append(f"trigger_type IN ({placeholders})")
@@ -309,7 +314,7 @@ class TriggerStore:
                 ][: int(limit)]
                 for job_id in job_ids:
                     self._conn.execute(
-                        """
+                        f"""
                         UPDATE trigger_jobs
                         SET status='running',
                             attempts=attempts + 1,
@@ -317,9 +322,9 @@ class TriggerStore:
                             locked_by=?,
                             error=NULL
                         WHERE job_id=?
-                          AND status IN ('pending', 'failed_retryable')
+                          AND status IN ({status_placeholders})
                         """,
-                        (now, worker, job_id),
+                        (now, worker, job_id, *requested_statuses),
                     )
                 self._conn.commit()
             except Exception:
@@ -591,6 +596,17 @@ def _normalize_trigger_types(value: tuple[str, ...] | None) -> tuple[str, ...]:
         item
         for item in dict.fromkeys(str(raw).strip().upper() for raw in value)
         if item in TRIGGER_TYPES
+    )
+
+
+def _normalize_claim_statuses(value: tuple[str, ...] | None) -> tuple[str, ...]:
+    if not value:
+        return ("pending", "failed_retryable")
+    claimable = {"pending", "failed_retryable"}
+    return tuple(
+        item
+        for item in dict.fromkeys(str(raw).strip().lower() for raw in value)
+        if item in claimable
     )
 
 

@@ -13,6 +13,9 @@ export function summarizeToolInput(
 
 export function summarizeToolResult(result: unknown): string {
   const rendered = stringifyUnknown(result);
+  if (typeof rendered !== "string" || rendered.trim().length === 0) {
+    return "No result";
+  }
   return truncate(rendered.replace(/\s+/g, " ").trim(), 160);
 }
 

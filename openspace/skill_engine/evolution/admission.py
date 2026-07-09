@@ -66,6 +66,15 @@ _EPHEMERAL_CAPTURE_TERMS = (
     "/tmp/",
     "/private/tmp",
 )
+_SCRATCHPAD_EPHEMERAL_CAPTURE_TERMS = (
+    "/tmp/",
+    "/private/tmp",
+)
+_CONTEXT_EPHEMERAL_CAPTURE_TERMS = tuple(
+    term
+    for term in _EPHEMERAL_CAPTURE_TERMS
+    if term not in _SCRATCHPAD_EPHEMERAL_CAPTURE_TERMS
+)
 _DERIVED_DIVERGENCE_TERMS = (
     "divergence",
     "diverge",
@@ -154,11 +163,15 @@ class EvolutionAdmission:
         skill_store: Any | None = None,
         registry: Any | None = None,
         recurrence_threshold: int = 2,
+        allow_single_observation_capture: bool = False,
     ) -> None:
         self.evidence_store = evidence_store
         self.skill_store = skill_store
         self.registry = registry
         self.recurrence_threshold = max(2, int(recurrence_threshold or 2))
+        self.allow_single_observation_capture = bool(
+            allow_single_observation_capture
+        )
 
     def admit(
         self,
@@ -486,12 +499,17 @@ class EvolutionAdmission:
             warnings.append("reusable_boundary_uncertain")
 
         repeated_or_manual = self._is_repeated_or_user_explicit(decision, packet)
-        if not repeated_or_manual:
+        single_observation_allowed = (
+            self.allow_single_observation_capture and not repeated_or_manual
+        )
+        if not repeated_or_manual and not single_observation_allowed:
             warnings.append("single_observation")
+        elif single_observation_allowed:
+            warnings.append("single_observation_allowed")
 
         outcome = "candidate"
         if (
-            repeated_or_manual
+            (repeated_or_manual or single_observation_allowed)
             and "workflow_trivial_or_uncertain" not in warnings
             and "reusable_boundary_uncertain" not in warnings
         ):
@@ -641,7 +659,7 @@ def _is_quality_signal_context(
         return True
     if str(getattr(packet, "profile_name", "") or "") == "quality_signal":
         return True
-    return bool(_quality_signal_refs(packet))
+    return False
 
 
 def _quality_signal_packet_failures(
@@ -1134,17 +1152,26 @@ def _capture_depends_on_ephemeral_context(
     packet: EvidencePacket,
     decision: Any,
 ) -> bool:
-    parts = [_decision_text(decision)]
+    if _contains_any(_decision_text(decision), _EPHEMERAL_CAPTURE_TERMS):
+        return True
+
+    manual_text = "\n".join(_ref_text(ref) for ref in _refs(packet, "manual_request_ref"))
+    if _contains_any(manual_text, _EPHEMERAL_CAPTURE_TERMS):
+        return True
+
+    parts: list[str] = []
     for ref_type in (
         "runtime_snapshot",
         "transcript_message",
         "tool_event",
         "tool_result",
         "file_history",
-        "manual_request_ref",
     ):
-        parts.extend(_ref_text(ref) for ref in _refs(packet, ref_type))
-    return _contains_any("\n".join(parts), _EPHEMERAL_CAPTURE_TERMS)
+        for ref in _refs(packet, ref_type):
+            if getattr(ref, "contains_secret", False):
+                return True
+            parts.append(_ref_text(ref))
+    return _contains_any("\n".join(parts), _CONTEXT_EPHEMERAL_CAPTURE_TERMS)
 
 
 def _is_repeated_or_user_explicit(

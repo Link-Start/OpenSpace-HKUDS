@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import re
 import traceback
 import uuid
+from pathlib import Path
 from typing import Any
 
 from openspace.utils.logging import Logger
@@ -14,6 +17,26 @@ from .execution_request import ExecutionRequest, ExecutionResult
 from .execution_scheduler import ExecutionScheduler
 
 logger = Logger.get_logger(__name__)
+
+
+def _normal_path(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    return str(Path(text).expanduser())
+
+
+def _first_env_skill_dir() -> str | None:
+    raw = os.environ.get("OPENSPACE_HOST_SKILL_DIRS")
+    if not raw:
+        return None
+    for item in re.split(rf"[,{re.escape(os.pathsep)}]", raw):
+        path = _normal_path(item)
+        if path:
+            return path
+    return None
 
 
 class ExecutionLifecycle:
@@ -33,6 +56,26 @@ class ExecutionLifecycle:
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._runtime, name)
+
+    def _initial_capture_skill_dir(self, request: ExecutionRequest) -> str | None:
+        for value in (
+            request.capture_skill_dir,
+            getattr(self.config, "capture_skill_dir", None),
+            os.environ.get("OPENSPACE_CAPTURE_SKILL_DIR"),
+            _first_env_skill_dir(),
+        ):
+            path = _normal_path(value)
+            if path:
+                return path
+        return None
+
+    def _default_capture_skill_dir(self, workspace_dir: Any) -> str:
+        workspace = _normal_path(workspace_dir)
+        if workspace is None:
+            workspace = _normal_path(getattr(self.config, "workspace_dir", None))
+        if workspace is None:
+            workspace = os.getcwd()
+        return str(Path(workspace).expanduser() / ".openspace" / "skills")
 
     async def execute(self, request: ExecutionRequest) -> ExecutionResult:
         task = request.prompt
@@ -60,7 +103,7 @@ class ExecutionLifecycle:
 
         result: dict[str, Any] = {}
         evolved_skills: list[dict[str, Any]] = []
-        capture_skill_dir = request.capture_skill_dir
+        capture_skill_dir = self._initial_capture_skill_dir(request)
         execution_context: dict[str, Any] = {}
         execution_time = 0.0
         cancelled_exc: asyncio.CancelledError | None = None
@@ -102,6 +145,10 @@ class ExecutionLifecycle:
                 task_id=task_id,
                 execution_context=execution_context,
             )
+            if capture_skill_dir is None:
+                capture_skill_dir = self._default_capture_skill_dir(workspace_dir)
+            execution_context["capture_skill_dir"] = capture_skill_dir
+            self.state.capture_skill_dir = capture_skill_dir
             self.scheduler.install_ensure(
                 execution_context=execution_context,
                 low_latency_profiler=low_latency_profiler,

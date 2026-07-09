@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import os
+import time
 from contextlib import nullcontext
 from typing import Any
 
@@ -14,11 +16,121 @@ from openspace.agents.turns import stop_policy
 from openspace.agents.turns import tool_turn_controller
 from openspace.agents.turns.context import TurnControllerContext
 from openspace.agents.turns.state import TurnState
+from openspace.agents.turns.task_query import resolve_task_query
 from openspace.services.memory.recall import start_relevant_memory_prefetch
 from openspace.services.conversation.messages import extract_discovered_tool_names
 from openspace.utils.logging import Logger
 
 logger = Logger.get_logger(__name__)
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def _maybe_build_bench_finalize_nudge(state: TurnState) -> dict[str, Any] | None:
+    if not _env_bool("OPENSPACE_BENCH_FINALIZE_NUDGE_ENABLED"):
+        return None
+
+    max_nudges = max(0, _env_int("OPENSPACE_BENCH_FINALIZE_NUDGE_MAX", 1))
+    if state.bench_finalize_nudge_count >= max_nudges:
+        return None
+
+    elapsed_s = time.monotonic() - state.started_at_monotonic
+    after_sec = _env_int("OPENSPACE_BENCH_FINALIZE_NUDGE_AFTER_SEC", 0)
+    after_iteration = _env_int("OPENSPACE_BENCH_FINALIZE_NUDGE_AFTER_ITERATION", 0)
+
+    due_by_time = after_sec > 0 and elapsed_s >= after_sec
+    due_by_iteration = (
+        after_iteration > 0
+        and state.current_iteration >= after_iteration
+    )
+    if not due_by_time and not due_by_iteration:
+        return None
+
+    state.bench_finalize_nudge_count += 1
+    state.bench_finalize_nudge_iteration = state.current_iteration
+    state.bench_finalize_nudge_monotonic = time.monotonic()
+    return {
+        "role": "user",
+        "content": (
+            "Terminal-Bench finalization checkpoint: the run budget is getting "
+            "low. Immediately preserve the best current answer in the exact "
+            "requested /app artifact path(s). If you have found a passing "
+            "payload, script, data file, or command output, write it to the "
+            "target artifact now. Run at most one quick verification against "
+            "the visible checker or artifact parseability, then stop open-ended "
+            "exploration and provide the final response."
+        ),
+        "_meta": {
+            "type": "bench_finalize_nudge",
+            "is_meta": True,
+            "elapsed_s": round(elapsed_s, 3),
+            "iteration": state.current_iteration,
+        },
+    }
+
+
+def _bench_finalize_budget_exhausted(state: TurnState) -> tuple[bool, str]:
+    if not _env_bool("OPENSPACE_BENCH_FINALIZE_NUDGE_ENABLED"):
+        return False, ""
+    if state.bench_finalize_nudge_count <= 0:
+        return False, ""
+
+    stop_after_iterations = _env_int(
+        "OPENSPACE_BENCH_FINALIZE_STOP_AFTER_ITERATIONS",
+        0,
+    )
+    if (
+        stop_after_iterations > 0
+        and state.bench_finalize_nudge_iteration is not None
+        and state.current_iteration
+        > state.bench_finalize_nudge_iteration + stop_after_iterations
+    ):
+        return (
+            True,
+            f"{stop_after_iterations} iterations after finalize nudge",
+        )
+
+    stop_after_sec = _env_int("OPENSPACE_BENCH_FINALIZE_STOP_AFTER_SEC", 0)
+    if (
+        stop_after_sec > 0
+        and state.bench_finalize_nudge_monotonic is not None
+        and time.monotonic() - state.bench_finalize_nudge_monotonic >= stop_after_sec
+    ):
+        return True, f"{stop_after_sec}s after finalize nudge"
+
+    return False, ""
+
+
+def _bench_checker_pass_budget_exhausted(state: TurnState) -> tuple[bool, str]:
+    stop_after_iterations = _env_int(
+        "OPENSPACE_BENCH_STOP_AFTER_CHECKER_PASS_ITERATIONS",
+        0,
+    )
+    pass_iteration = getattr(state, "bench_visible_checker_pass_iteration", None)
+    if (
+        stop_after_iterations > 0
+        and pass_iteration is not None
+        and not bool(getattr(state, "bench_visible_checker_failed", False))
+        and state.current_iteration > pass_iteration + stop_after_iterations
+    ):
+        return True, f"{stop_after_iterations} iterations after visible checker pass"
+    return False, ""
+
 
 def _append_lifecycle_hook_contexts(
     context: dict[str, Any],
@@ -94,6 +206,7 @@ async def run_grounding_turn(agent: Any, context: dict[str, Any]) -> dict[str, A
         return {"error": "No instruction provided", "status": "error"}
 
     self._current_instruction = instruction
+    tool_retrieval_instruction = resolve_task_query(context, instruction)
 
     logger.info(f"Grounding Agent: Processing instruction at step {self.step}")
     agent_id = str(context.get("agent_id") or "primary")
@@ -191,7 +304,7 @@ async def run_grounding_turn(agent: Any, context: dict[str, Any]) -> dict[str, A
             )
         active_tool_policy = build_active_tool_policy(
             profile_name=classified_profile.name,
-            instruction=instruction,
+            instruction=tool_retrieval_instruction,
             tools=tools,
             hard_active_tool_limit=context.get("hard_active_tool_limit"),
         )
@@ -202,7 +315,9 @@ async def run_grounding_turn(agent: Any, context: dict[str, Any]) -> dict[str, A
         ]
     else:
         with _latency_span("turn.tool_preselection"):
-            preselected_tools = await self._get_available_tools(instruction)
+            preselected_tools = await self._get_available_tools(
+                tool_retrieval_instruction
+            )
         with _latency_span("turn.tool_universe"):
             tools = await self._get_tool_universe(preselected_tools)
         tools = self._with_memory_mode_tools(tools, memory_mode)
@@ -239,6 +354,12 @@ async def run_grounding_turn(agent: Any, context: dict[str, Any]) -> dict[str, A
     context["agent_definitions"] = agent_definitions
     self._last_tools = tools
     tool_set_signature = self._tool_set_signature(tools)
+    configured_active_tool_names = context.get("active_tool_names")
+    hard_active_tool_names = (
+        {str(name) for name in configured_active_tool_names if str(name)}
+        if configured_active_tool_names is not None
+        else None
+    )
     discovered_tool_names = set(context.get("discovered_tool_names") or ())
     if session_capability_state_enabled:
         discovered_tool_names.update(
@@ -248,16 +369,25 @@ async def run_grounding_turn(agent: Any, context: dict[str, Any]) -> dict[str, A
         extract_discovered_tool_names(context.get("conversation_history") or [])
     )
     if active_tool_policy is None:
-        discovered_tool_names.update(
-            tool.name
-            for tool in preselected_tools
-            if getattr(tool, "is_deferred", False)
-        )
-        deferred_tool_names = self._deferred_tool_names(
-            tools,
-            discovered_tool_names=discovered_tool_names,
-        )
-        active_tool_names = None
+        if hard_active_tool_names is None:
+            discovered_tool_names.update(
+                tool.name
+                for tool in preselected_tools
+                if getattr(tool, "is_deferred", False)
+            )
+        configured_deferred_tool_names = context.get("policy_deferred_tool_names")
+        if configured_deferred_tool_names is not None:
+            deferred_tool_names = sorted(
+                str(name)
+                for name in configured_deferred_tool_names
+                if str(name) and str(name) not in discovered_tool_names
+            )
+        else:
+            deferred_tool_names = self._deferred_tool_names(
+                tools,
+                discovered_tool_names=discovered_tool_names,
+            )
+        active_tool_names = hard_active_tool_names
     else:
         deferred_tool_names = sorted(
             name
@@ -304,7 +434,7 @@ async def run_grounding_turn(agent: Any, context: dict[str, Any]) -> dict[str, A
     if self._recording_manager:
         from openspace.recording import RecordingManager
         await RecordingManager.record_retrieved_tools(
-            task_instruction=instruction,
+            task_instruction=tool_retrieval_instruction,
             tools=tools,
             preselection_debug_info=preselection_debug_info,
         )
@@ -495,7 +625,7 @@ async def run_grounding_turn(agent: Any, context: dict[str, Any]) -> dict[str, A
         await self._append_skill_discovery_delta_async(
             messages,
             tool_use_context,
-            query=instruction,
+            query=tool_retrieval_instruction,
             source="turn0_prefetch",
         )
 
@@ -583,6 +713,28 @@ async def run_grounding_turn(agent: Any, context: dict[str, Any]) -> dict[str, A
                 state.stop_reason_final = abort_stop_reason
                 break
 
+            bench_budget_exhausted, bench_budget_reason = (
+                _bench_finalize_budget_exhausted(state)
+            )
+            if bench_budget_exhausted:
+                state.stop_reason_final = "bench_finalize_budget"
+                logger.info(
+                    "Bench finalize budget exhausted: %s",
+                    bench_budget_reason,
+                )
+                break
+
+            checker_pass_budget_exhausted, checker_pass_budget_reason = (
+                _bench_checker_pass_budget_exhausted(state)
+            )
+            if checker_pass_budget_exhausted:
+                state.stop_reason_final = "bench_checker_pass_budget"
+                logger.info(
+                    "Bench checker-pass budget exhausted: %s",
+                    checker_pass_budget_reason,
+                )
+                break
+
             # ── 2b. Drain external messages (Implementation: getCommandsByMaxPriority) ─
             rewake_injected = await self._drain_messages(async_rewake_queue)
             if rewake_injected:
@@ -600,6 +752,19 @@ async def run_grounding_turn(agent: Any, context: dict[str, Any]) -> dict[str, A
                         tool_use_context,
                         messages=messages,
                     )
+
+            bench_finalize_nudge = _maybe_build_bench_finalize_nudge(state)
+            if bench_finalize_nudge:
+                messages.append(bench_finalize_nudge)
+                self._sync_tool_use_context_runtime(
+                    tool_use_context,
+                    messages=messages,
+                )
+                logger.info(
+                    "Bench finalize nudge %s injected at iteration %s",
+                    state.bench_finalize_nudge_count,
+                    current_iteration,
+                )
 
             # ── 2b½. Time-based microcompact (Implementation: microcompactMessages
             #    → maybeTimeBasedMicrocompact, runs BEFORE autoCompact).

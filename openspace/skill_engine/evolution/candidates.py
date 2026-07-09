@@ -1112,6 +1112,10 @@ def _blocked_reason_from_inputs(
     reason_text = str(reason or "").strip()
     if reason_text == "fix_only_mode_non_fix":
         return "policy_blocked:fix_only_non_fix"
+    if reason_text.startswith("behavior_eval_failed:"):
+        return reason_text
+    if reason_text == "behavior_eval_failed":
+        return "behavior_eval_failed"
     outcome = str(_attr(admission, "outcome") or "").strip().lower()
     failures = _str_list(_attr(admission, "hard_failures"))
     warnings = _str_list(_attr(admission, "warnings"))
@@ -1154,8 +1158,11 @@ def _needed_evidence_from_inputs(
     admission: Any,
     decision: Any,
 ) -> list[str]:
-    if str(reason or "").strip() == "fix_only_mode_non_fix":
+    reason_text = str(reason or "").strip()
+    if reason_text == "fix_only_mode_non_fix":
         return []
+    if reason_text.startswith("behavior_eval_failed:") or reason_text == "behavior_eval_failed":
+        return _behavior_eval_needed_evidence(reason_text)
     tags = [
         *_str_list(_attr(admission, "hard_failures")),
         *_str_list(_attr(admission, "warnings")),
@@ -1179,6 +1186,28 @@ def _needed_evidence_from_inputs(
             needed.append(text)
         elif lower.startswith("missing_"):
             needed.append(text)
+    return list(dict.fromkeys(needed))
+
+
+def _behavior_eval_needed_evidence(reason: str) -> list[str]:
+    lower = str(reason or "").strip().lower()
+    needed: list[str] = []
+    if "missing_executable_eval_evidence" in lower:
+        needed.append("executable_eval_evidence")
+    if "missing_executable_eval_cases" in lower:
+        needed.append("executable_eval_cases")
+    if "replay_tasks_require_external_runner" in lower:
+        needed.append("external_replay_runner")
+    if "missing_required_replay_runner" in lower:
+        needed.append("replay_runner")
+    if "routing_" in lower:
+        needed.append("routing_eval_repair")
+    if "deterministic_assertion_failed" in lower:
+        needed.append("deterministic_assertion_repair")
+    if "candidate_score_regressed" in lower:
+        needed.append("non_regressing_replay_score")
+    if not needed:
+        needed.append("behavior_eval_resolution")
     return list(dict.fromkeys(needed))
 
 

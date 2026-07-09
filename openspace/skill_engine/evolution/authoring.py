@@ -21,6 +21,8 @@ from openspace.skill_engine.patch import (
     PatchType,
     SkillEditResult,
     SKILL_FILENAME,
+    collect_skill_snapshot,
+    compute_unified_diff,
     stage_create_skill,
     stage_derive_skill,
     stage_fix_skill,
@@ -44,6 +46,25 @@ from openspace.utils.logging import Logger
 logger = Logger.get_logger(__name__)
 
 _SKILL_CONTENT_MAX_CHARS = 12_000
+_HIGH_RISK_RUNTIME_OVERLAY_FIELDS = {
+    "allowed-tools",
+    "disable-model-invocation",
+    "user-invocable",
+    "model",
+    "effort",
+    "hooks",
+    "context",
+    "agent",
+    "shell",
+}
+_RUNTIME_OVERLAY_FIELD_ALIASES = {
+    "allowed_tools": "allowed-tools",
+    "allowedTools": "allowed-tools",
+    "disable_model_invocation": "disable-model-invocation",
+    "disableModelInvocation": "disable-model-invocation",
+    "user_invocable": "user-invocable",
+    "userInvocable": "user-invocable",
+}
 
 
 @dataclass(frozen=True)
@@ -65,6 +86,8 @@ class StagedSkillEdit:
     critical_tools: list[str]
     overlay_fields: dict[str, Any]
     overlay_metadata: dict[str, Any]
+    intent_spec: dict[str, Any]
+    eval_plan: dict[str, Any]
     evidence_refs: list[str]
     apply_metadata: dict[str, Any]
     created_at: str
@@ -113,7 +136,13 @@ class SkillEvolverAuthoringBackend:
         self.staging_root = Path(staging_root).expanduser().resolve()
         self.evidence_store = evidence_store
 
-    async def author_from_action_packet(self, packet: EvidencePacket) -> AuthoringResult:
+    async def author_from_action_packet(
+        self,
+        packet: EvidencePacket,
+        *,
+        eval_feedback: Any | None = None,
+        previous_authoring: Any | None = None,
+    ) -> AuthoringResult:
         authoring_id = f"auth_{uuid.uuid4().hex}"
         staging_id = f"stage_{uuid.uuid4().hex}"
         staging_dir = self.staging_root / staging_id
@@ -173,7 +202,14 @@ class SkillEvolverAuthoringBackend:
             or decision_ref.preview
             or "Apply the admitted skill evolution."
         )
-        prompt = self._build_prompt(action_type, sources, packet, direction)
+        prompt = self._build_prompt(
+            action_type,
+            sources,
+            packet,
+            direction,
+            eval_feedback=eval_feedback,
+            previous_authoring=previous_authoring,
+        )
         category = _category(decision_ref) or (
             sources[0].record.category if sources else SkillCategory.WORKFLOW
         )
@@ -241,6 +277,11 @@ class SkillEvolverAuthoringBackend:
             proposed_name,
             sources[0].record if sources else None,
         )
+        overlay_fields, overlay_metadata = _safe_authoring_overlays(
+            action_type=action_type,
+            overlay_fields=dict(getattr(evolution_output, "overlay_fields", {}) or {}),
+            overlay_metadata=dict(getattr(evolution_output, "overlay_metadata", {}) or {}),
+        )
         staged_edit = StagedSkillEdit(
             staging_id=staging_id,
             decision_id=str(decision_ref.metadata.get("decision_id") or ""),
@@ -257,11 +298,15 @@ class SkillEvolverAuthoringBackend:
             content_snapshot=dict(edit_result.content_snapshot),
             tool_dependencies=tool_dependencies,
             critical_tools=critical_tools,
-            overlay_fields=dict(getattr(evolution_output, "overlay_fields", {}) or {}),
-            overlay_metadata=dict(getattr(evolution_output, "overlay_metadata", {}) or {}),
+            overlay_fields=overlay_fields,
+            overlay_metadata=overlay_metadata,
+            intent_spec=dict(getattr(evolution_output, "intent_spec", {}) or {}),
+            eval_plan=dict(getattr(evolution_output, "eval_plan", {}) or {}),
             evidence_refs=_evidence_refs(packet, decision_ref, admission_ref),
             apply_metadata={
                 "change_summary": getattr(evolution_output, "change_summary", None),
+                "intent_spec": dict(getattr(evolution_output, "intent_spec", {}) or {}),
+                "eval_plan": dict(getattr(evolution_output, "eval_plan", {}) or {}),
                 "source_packet_id": _source_packet_id(packet),
                 "action_packet_id": packet.packet_id,
                 "admission_id": admission_ref.metadata.get("admission_id"),
@@ -289,15 +334,20 @@ class SkillEvolverAuthoringBackend:
         sources: list[_SourceSkill],
         packet: EvidencePacket,
         direction: str,
+        *,
+        eval_feedback: Any | None = None,
+        previous_authoring: Any | None = None,
     ) -> str:
         packet_context = _packet_context(packet)
+        eval_context = _eval_revision_context(eval_feedback, previous_authoring)
         if action_type == "FIX":
             current = sources[0].content if sources else ""
-            return SkillEnginePrompts.evolution_fix(
+            base = SkillEnginePrompts.evolution_fix(
                 current_content=truncate(current, _SKILL_CONTENT_MAX_CHARS),
                 direction=direction,
                 failure_context=packet_context,
             )
+            return _append_eval_revision_context(base, eval_context)
         if action_type == "DERIVED":
             if len(sources) > 1:
                 parent_content = "\n\n---\n\n".join(
@@ -310,16 +360,18 @@ class SkillEvolverAuthoringBackend:
                     sources[0].content if sources else "",
                     _SKILL_CONTENT_MAX_CHARS,
                 )
-            return SkillEnginePrompts.evolution_derived(
+            base = SkillEnginePrompts.evolution_derived(
                 parent_content=parent_content,
                 direction=direction,
                 execution_insights=packet_context,
             )
-        return SkillEnginePrompts.evolution_captured(
+            return _append_eval_revision_context(base, eval_context)
+        base = SkillEnginePrompts.evolution_captured(
             direction=direction,
             category=SkillCategory.WORKFLOW.value,
             execution_highlights=packet_context,
         )
+        return _append_eval_revision_context(base, eval_context)
 
     async def _stage_edit(
         self,
@@ -357,19 +409,28 @@ class SkillEvolverAuthoringBackend:
         else:
             proposed_name = get_frontmatter_field(edit_content, "name") or ""
             if not proposed_name:
-                raise ValueError("CAPTURED authoring output missing skill name")
+                proposed_name = _captured_fallback_name(packet)
             proposed_name = _sanitize_skill_name(proposed_name)
             edit_content = set_frontmatter_field(edit_content, "name", proposed_name)
             capture_root = _capture_root(packet)
             if capture_root is None:
                 raise ValueError("CAPTURED action packet missing capture destination root")
             proposed_dir = staging_dir / "proposed" / proposed_name
-            apply_fn = lambda content: stage_create_skill(
-                staging_dir,
-                proposed_name,
-                content,
-                PatchType.AUTO,
-            )
+            def apply_fn(content: str) -> SkillEditResult:
+                result = stage_create_skill(
+                    staging_dir,
+                    proposed_name,
+                    content,
+                    PatchType.AUTO,
+                )
+                if result.ok:
+                    _ensure_captured_frontmatter(
+                        proposed_dir,
+                        proposed_name=proposed_name,
+                        packet=packet,
+                        result=result,
+                    )
+                return result
             target_dir = capture_root / proposed_name
 
         retry = getattr(self.evolver, "_apply_with_retry", None)
@@ -466,6 +527,44 @@ class SkillEvolverAuthoringBackend:
             },
         )
         self.evidence_store.ingest_event(event)
+
+
+def _safe_authoring_overlays(
+    *,
+    action_type: str,
+    overlay_fields: dict[str, Any],
+    overlay_metadata: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    if action_type != "CAPTURED":
+        return overlay_fields, overlay_metadata
+
+    cleaned_fields = dict(overlay_fields)
+    cleaned_metadata = dict(overlay_metadata)
+    removed: list[str] = []
+    for key in list(cleaned_fields):
+        normalized = _normalize_runtime_overlay_key(key)
+        if normalized not in _HIGH_RISK_RUNTIME_OVERLAY_FIELDS:
+            continue
+        cleaned_fields.pop(key, None)
+        cleaned_metadata.pop(key, None)
+        cleaned_metadata.pop(normalized, None)
+        removed.append(normalized)
+
+    if removed:
+        cleaned_metadata["_authoring_removed_overlay_fields"] = {
+            "fields": sorted(set(removed)),
+            "reason": (
+                "CAPTURED skills cannot introduce high-risk runtime overlay "
+                "fields without explicit admission approval."
+            ),
+            "source": "authoring_backend",
+        }
+    return cleaned_fields, cleaned_metadata
+
+
+def _normalize_runtime_overlay_key(key: Any) -> str:
+    text = str(key or "").strip()
+    return _RUNTIME_OVERLAY_FIELD_ALIASES.get(text, text)
 
 
 def _source_skills(
@@ -619,6 +718,63 @@ def _source_packet_id(packet: EvidencePacket) -> str | None:
     return str(packet_ref.metadata.get("packet_id") or packet_ref.ref_id).removeprefix("packet:")
 
 
+def _eval_revision_context(
+    eval_feedback: Any | None,
+    previous_authoring: Any | None,
+) -> str:
+    if eval_feedback is None and previous_authoring is None:
+        return ""
+    parts: list[str] = []
+    if eval_feedback is not None:
+        parts.append(_format_eval_feedback(eval_feedback))
+    staged = getattr(previous_authoring, "staged_edit", None)
+    if staged is None and isinstance(previous_authoring, dict):
+        staged = previous_authoring.get("staged_edit")
+    snapshot = getattr(staged, "content_snapshot", None)
+    if snapshot is None and isinstance(staged, dict):
+        snapshot = staged.get("content_snapshot")
+    if isinstance(snapshot, dict) and snapshot:
+        rendered = []
+        for rel_path, content in sorted(snapshot.items()):
+            text = str(content)
+            rendered.append(f"### Previous draft: {rel_path}\n{text[:12000]}")
+        parts.append("\n\n".join(rendered))
+    return "\n\n".join(part for part in parts if part.strip())
+
+
+def _format_eval_feedback(eval_feedback: Any) -> str:
+    if isinstance(eval_feedback, str):
+        return eval_feedback
+    to_dict = getattr(eval_feedback, "to_dict", None)
+    if callable(to_dict):
+        payload = to_dict()
+    elif isinstance(eval_feedback, dict):
+        payload = eval_feedback
+    else:
+        payload = {
+            "outcome": getattr(eval_feedback, "outcome", ""),
+            "failures": getattr(eval_feedback, "failures", []),
+            "warnings": getattr(eval_feedback, "warnings", []),
+        }
+    try:
+        return json.dumps(payload, ensure_ascii=False, indent=2, default=str)
+    except Exception:
+        return str(payload)
+
+
+def _append_eval_revision_context(prompt: str, eval_context: str) -> str:
+    if not eval_context.strip():
+        return prompt
+    return (
+        f"{prompt.rstrip()}\n\n"
+        "## Behavior Eval Feedback From Previous Draft\n\n"
+        "A previous draft failed the behavior-evaluation gate. Revise the skill "
+        "content and the structured finalization fields so the new draft satisfies "
+        "the feedback without overfitting to the eval text.\n\n"
+        f"{eval_context.strip()}\n"
+    )
+
+
 def _derived_name(
     edit_content: str,
     sources: list[_SourceSkill],
@@ -639,6 +795,65 @@ def _sanitize_skill_name(name: str) -> str:
     clean = re.sub(r"[^a-z0-9\-]", "-", name.lower().strip())
     clean = re.sub(r"-{2,}", "-", clean).strip("-")
     return clean[:50].strip("-") or "skill"
+
+
+def _captured_fallback_name(packet: EvidencePacket) -> str:
+    task_id = str(getattr(packet.scope, "task_id", "") or "").strip()
+    profile = str(getattr(packet, "subprofile", "") or "").strip()
+    packet_id = str(getattr(packet, "packet_id", "") or uuid.uuid4().hex[:8])
+    seed = task_id or profile or packet_id
+    return f"captured-{seed}-{packet_id[-6:]}"
+
+
+def _ensure_captured_frontmatter(
+    skill_dir: Path,
+    *,
+    proposed_name: str,
+    packet: EvidencePacket,
+    result: SkillEditResult,
+) -> None:
+    skill_file = skill_dir / SKILL_FILENAME
+    if not skill_file.exists():
+        return
+    try:
+        content = skill_file.read_text(encoding="utf-8")
+    except OSError:
+        return
+
+    updated = content
+    if not get_frontmatter_field(updated, "name"):
+        updated = set_frontmatter_field(updated, "name", proposed_name)
+    if not get_frontmatter_field(updated, "description"):
+        updated = set_frontmatter_field(
+            updated,
+            "description",
+            _captured_description(packet, proposed_name),
+        )
+    if updated == content:
+        return
+
+    skill_file.write_text(updated, encoding="utf-8")
+    snapshot = collect_skill_snapshot(skill_dir)
+    result.content_snapshot = snapshot
+    result.content_diff = "\n".join(
+        compute_unified_diff("", text, filename=name)
+        for name, text in sorted(snapshot.items())
+        if compute_unified_diff("", text, filename=name)
+    )
+
+
+def _captured_description(packet: EvidencePacket, proposed_name: str) -> str:
+    decision_ref = _single_ref(packet, "decision_rationale_ref")
+    if decision_ref is not None:
+        raw = (
+            decision_ref.metadata.get("reason_summary")
+            or decision_ref.preview
+            or proposed_name
+        )
+    else:
+        raw = proposed_name
+    text = " ".join(str(raw or proposed_name).split())
+    return truncate(text, 240) or proposed_name
 
 
 def _proposed_skill_id(
