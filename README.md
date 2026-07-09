@@ -6,7 +6,7 @@
 
 ## OpenSpace: The Quality-First Skill Hub for AI Agents
 
-| 📊 **Real-Task Validation** | 🧬 **Evidence-Driven Evolution** | 🌐 **Hierarchical Skill Hub** | 🛠️ **E2E Quality Records** |
+| 📊 **Real-Task Validated** | 🧬 **Evidence-Driven Evolution** | 🌐 **Hierarchical Skill Hub** | 🛠️ **End-to-End Quality Records** |
 
 [![Agents](https://img.shields.io/badge/Agents-Claude_Code%20%7C%20Codex%20%7C%20OpenClaw%20%7C%20...-99C9BF.svg)](https://modelcontextprotocol.io/)
 [![Python](https://img.shields.io/badge/Python-3.12+-FCE7D6.svg)](https://www.python.org/)
