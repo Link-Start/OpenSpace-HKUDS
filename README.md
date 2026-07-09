@@ -1,7 +1,7 @@
 <div align="center">
 
 <picture>
-    <img src="assets/logo_version_2.png" width="180px" style="border: none; box-shadow: none;" alt="OpenSpace Logo">
+    <img src="assets/logo_version_2.1.png" width="300px" style="border: none; box-shadow: none;" alt="OpenSpace Logo">
 </picture>
 
 ## OpenSpace: The Quality-First Skill Hub for AI Agents
