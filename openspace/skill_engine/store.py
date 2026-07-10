@@ -5,6 +5,7 @@ Tables:
   skill_lineage_parents  — Lineage parent-child relationships (many-to-many)
   execution_analyses     — ExecutionAnalysis records (one per task)
   skill_judgments         — Per-skill judgments within an analysis
+  skill_trust_observations — Independent success/failure evidence for trust
   skill_tool_deps        — Tool dependencies
   skill_tags             — Auxiliary tags
 """
@@ -32,6 +33,7 @@ from .types import (
     SkillLineage,
     SkillOrigin,
     SkillRecord,
+    SkillTrustState,
     SkillVisibility,
 )
 from openspace.utils.logging import Logger
@@ -88,6 +90,8 @@ def _skill_record_evidence_payload(
         "description": record.description,
         "path": record.path,
         "is_active": bool(record.is_active),
+        "enabled": bool(record.enabled),
+        "trust_state": record.trust_state.value,
         "category": record.category.value,
         "tags": list(record.tags),
         "visibility": record.visibility.value,
@@ -108,6 +112,8 @@ def _skill_record_evidence_payload(
         "total_applied": record.total_applied,
         "total_completions": record.total_completions,
         "total_fallbacks": record.total_fallbacks,
+        "trust_successes": record.trust_successes,
+        "trust_failures": record.trust_failures,
         "first_seen": record.first_seen.isoformat(),
         "last_updated": record.last_updated.isoformat(),
         "lifecycle_event": lifecycle_event,
@@ -301,6 +307,8 @@ CREATE TABLE IF NOT EXISTS skill_records (
     description            TEXT NOT NULL DEFAULT '',
     path                   TEXT NOT NULL DEFAULT '',
     is_active              INTEGER NOT NULL DEFAULT 1,
+    enabled                INTEGER NOT NULL DEFAULT 1,
+    trust_state            TEXT NOT NULL DEFAULT 'trusted',
     category               TEXT NOT NULL DEFAULT 'workflow',
     visibility             TEXT NOT NULL DEFAULT 'private',
     creator_id             TEXT NOT NULL DEFAULT '',
@@ -405,6 +413,22 @@ CREATE INDEX IF NOT EXISTS idx_skill_events_skill
     ON skill_events(skill_id, event_type, created_at);
 CREATE INDEX IF NOT EXISTS idx_skill_events_task
     ON skill_events(task_id);
+
+CREATE TABLE IF NOT EXISTS skill_trust_observations (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    skill_id           TEXT NOT NULL
+        REFERENCES skill_records(skill_id) ON DELETE CASCADE,
+    observation_id     TEXT NOT NULL,
+    task_id            TEXT NOT NULL DEFAULT '',
+    session_id         TEXT NOT NULL DEFAULT '',
+    outcome            TEXT NOT NULL CHECK(outcome IN ('success', 'failure')),
+    source             TEXT NOT NULL DEFAULT '',
+    evidence_refs_json TEXT NOT NULL DEFAULT '[]',
+    created_at         TEXT NOT NULL,
+    UNIQUE(skill_id, observation_id)
+);
+CREATE INDEX IF NOT EXISTS idx_skill_trust_outcome
+    ON skill_trust_observations(skill_id, outcome, id);
 """
 
 
@@ -422,7 +446,12 @@ class SkillStore:
             rec = store.load_record(skill_id)
     """
 
-    def __init__(self, db_path: Optional[Path] = None) -> None:
+    def __init__(
+        self,
+        db_path: Optional[Path] = None,
+        *,
+        trust_promotion_min_independent_successes: int = 2,
+    ) -> None:
         if db_path is None:
             db_dir = PROJECT_ROOT / ".openspace"
             db_dir.mkdir(parents=True, exist_ok=True)
@@ -433,6 +462,10 @@ class SkillStore:
         self._mu = threading.Lock()
         self._closed = False
         self._evidence_sink: SkillEvidenceSink | None = None
+        self.trust_promotion_min_independent_successes = max(
+            1,
+            int(trust_promotion_min_independent_successes or 2),
+        )
 
         # Crash recovery: clean up stale WAL/SHM from unclean shutdown
         self._cleanup_wal_on_startup()
@@ -511,6 +544,24 @@ class SkillStore:
                 "skill_records",
                 "lineage_evolution_action_id",
                 "TEXT",
+            )
+            self._ensure_column_locked(
+                "skill_records",
+                "enabled",
+                "INTEGER NOT NULL DEFAULT 1",
+            )
+            self._ensure_column_locked(
+                "skill_records",
+                "trust_state",
+                "TEXT NOT NULL DEFAULT 'trusted'",
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sr_enabled "
+                "ON skill_records(enabled)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sr_trust "
+                "ON skill_records(trust_state)"
             )
             self._ensure_column_locked(
                 "skill_records",
@@ -763,6 +814,60 @@ class SkillStore:
         )
         self._emit_evidence_now("skill_event", row)
         return row
+
+    async def record_trust_observation(
+        self,
+        skill_id: str,
+        observation_id: str,
+        outcome: str,
+        *,
+        task_id: str = "",
+        session_id: str = "",
+        source: str = "",
+        evidence_refs: Optional[Iterable[str]] = None,
+    ) -> Optional[SkillRecord]:
+        """Record one independent skill outcome and update its trust state."""
+
+        result = await asyncio.to_thread(
+            self._record_trust_observation_sync,
+            skill_id,
+            observation_id,
+            outcome,
+            task_id,
+            session_id,
+            source,
+            list(evidence_refs or []),
+        )
+        for row in result.get("events", []):
+            await self._emit_evidence("skill_event", row)
+        payload = result.get("record_payload")
+        if payload:
+            await self._emit_evidence("skill_record", payload)
+        return result.get("record")
+
+    async def set_skill_enabled(self, skill_id: str, enabled: bool) -> bool:
+        """Enable or disable a skill without changing revision activity."""
+
+        changed, event_row, payload = await asyncio.to_thread(
+            self._set_skill_enabled_sync,
+            skill_id,
+            bool(enabled),
+        )
+        if event_row:
+            await self._emit_evidence("skill_event", event_row)
+        if payload:
+            await self._emit_evidence("skill_record", payload)
+        return changed
+
+    def is_skill_enabled(self, skill_id: str) -> bool:
+        """Return whether a known skill is enabled; unknown skills fail open."""
+
+        with self._reader() as conn:
+            row = conn.execute(
+                "SELECT enabled FROM skill_records WHERE skill_id=?",
+                (skill_id,),
+            ).fetchone()
+            return True if row is None else bool(row["enabled"])
 
     async def _emit_evidence(self, event_type: str, payload: dict[str, Any]) -> None:
         sink = self._evidence_sink
@@ -1111,6 +1216,228 @@ class SkillStore:
             "created_at": created_at,
         }
 
+    @_db_retry()
+    def _record_trust_observation_sync(
+        self,
+        skill_id: str,
+        observation_id: str,
+        outcome: str,
+        task_id: str = "",
+        session_id: str = "",
+        source: str = "",
+        evidence_refs: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        self._ensure_open()
+        normalized_outcome = str(outcome or "").strip().lower()
+        if normalized_outcome not in {"success", "failure"}:
+            raise ValueError("trust observation outcome must be success or failure")
+        normalized_observation_id = str(observation_id or "").strip()
+        if not skill_id or not normalized_observation_id:
+            raise ValueError("skill_id and observation_id are required")
+
+        with self._mu:
+            self._conn.execute("BEGIN")
+            try:
+                result = self._record_trust_observation_locked(
+                    skill_id=skill_id,
+                    observation_id=normalized_observation_id,
+                    outcome=normalized_outcome,
+                    task_id=task_id,
+                    session_id=session_id,
+                    source=source,
+                    evidence_refs=evidence_refs or [],
+                )
+                self._conn.commit()
+                return result
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def _record_trust_observation_locked(
+        self,
+        *,
+        skill_id: str,
+        observation_id: str,
+        outcome: str,
+        task_id: str,
+        session_id: str,
+        source: str,
+        evidence_refs: List[str],
+    ) -> Dict[str, Any]:
+        record_row = self._conn.execute(
+            "SELECT * FROM skill_records WHERE skill_id=?",
+            (skill_id,),
+        ).fetchone()
+        if record_row is None:
+            return {"record": None, "record_payload": None, "events": []}
+
+        previous = self._conn.execute(
+            "SELECT outcome FROM skill_trust_observations "
+            "WHERE skill_id=? AND observation_id=?",
+            (skill_id, observation_id),
+        ).fetchone()
+        previous_outcome = str(previous["outcome"] or "") if previous else ""
+        normalized_refs = list(
+            dict.fromkeys(str(ref).strip() for ref in evidence_refs if str(ref).strip())
+        )
+        now_iso = datetime.now().isoformat()
+        self._conn.execute(
+            """
+            INSERT INTO skill_trust_observations (
+                skill_id, observation_id, task_id, session_id, outcome,
+                source, evidence_refs_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(skill_id, observation_id) DO UPDATE SET
+                task_id=excluded.task_id,
+                session_id=excluded.session_id,
+                outcome=excluded.outcome,
+                source=excluded.source,
+                evidence_refs_json=excluded.evidence_refs_json,
+                created_at=excluded.created_at
+            """,
+            (
+                skill_id,
+                observation_id,
+                task_id or "",
+                session_id or "",
+                outcome,
+                source or "",
+                json.dumps(normalized_refs, ensure_ascii=False),
+                now_iso,
+            ),
+        )
+
+        counts = self._conn.execute(
+            """
+            SELECT
+                SUM(CASE WHEN outcome='success' THEN 1 ELSE 0 END) AS successes,
+                SUM(CASE WHEN outcome='failure' THEN 1 ELSE 0 END) AS failures
+            FROM skill_trust_observations WHERE skill_id=?
+            """,
+            (skill_id,),
+        ).fetchone()
+        successes = int(counts["successes"] or 0)
+        failures = int(counts["failures"] or 0)
+        last_failure_id = int(
+            self._conn.execute(
+                "SELECT COALESCE(MAX(id), 0) FROM skill_trust_observations "
+                "WHERE skill_id=? AND outcome='failure'",
+                (skill_id,),
+            ).fetchone()[0]
+            or 0
+        )
+        successes_since_failure = int(
+            self._conn.execute(
+                "SELECT COUNT(*) FROM skill_trust_observations "
+                "WHERE skill_id=? AND outcome='success' AND id>?",
+                (skill_id, last_failure_id),
+            ).fetchone()[0]
+            or 0
+        )
+
+        previous_state = SkillTrustState(
+            str(record_row["trust_state"] or SkillTrustState.TRUSTED.value)
+        )
+        next_state = previous_state
+        if outcome == "failure":
+            next_state = SkillTrustState.PROVISIONAL
+        elif (
+            previous_state == SkillTrustState.PROVISIONAL
+            and successes_since_failure
+            >= self.trust_promotion_min_independent_successes
+        ):
+            next_state = SkillTrustState.TRUSTED
+
+        self._conn.execute(
+            "UPDATE skill_records SET trust_state=?, last_updated=? WHERE skill_id=?",
+            (next_state.value, now_iso, skill_id),
+        )
+
+        events: List[Dict[str, Any]] = []
+        observation_changed = previous is None or previous_outcome != outcome
+        event_metadata = {
+            "observation_id": observation_id,
+            "outcome": outcome,
+            "session_id": session_id or "",
+            "evidence_refs": normalized_refs,
+            "trust_successes": successes,
+            "trust_failures": failures,
+            "successes_since_failure": successes_since_failure,
+            "previous_trust_state": previous_state.value,
+            "trust_state": next_state.value,
+        }
+        if observation_changed:
+            events.append(
+                self._insert_skill_event_locked(
+                    skill_id,
+                    "trust_observed",
+                    source=source,
+                    task_id=task_id,
+                    metadata=event_metadata,
+                )
+            )
+        if next_state != previous_state:
+            transition = (
+                "trust_promoted"
+                if next_state == SkillTrustState.TRUSTED
+                else "trust_demoted"
+            )
+            events.append(
+                self._insert_skill_event_locked(
+                    skill_id,
+                    transition,
+                    source=source,
+                    task_id=task_id,
+                    metadata=event_metadata,
+                )
+            )
+
+        updated_row = self._conn.execute(
+            "SELECT * FROM skill_records WHERE skill_id=?",
+            (skill_id,),
+        ).fetchone()
+        record = self._to_record(self._conn, updated_row)
+        return {
+            "record": record,
+            "record_payload": _skill_record_evidence_payload(
+                record,
+                "trust_updated",
+            ),
+            "events": events,
+        }
+
+    @_db_retry()
+    def _set_skill_enabled_sync(
+        self,
+        skill_id: str,
+        enabled: bool,
+    ) -> tuple[bool, Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+        self._ensure_open()
+        with self._mu:
+            row = self._conn.execute(
+                "SELECT enabled FROM skill_records WHERE skill_id=?",
+                (skill_id,),
+            ).fetchone()
+            if row is None or bool(row["enabled"]) == enabled:
+                return False, None, None
+            now_iso = datetime.now().isoformat()
+            self._conn.execute(
+                "UPDATE skill_records SET enabled=?, last_updated=? WHERE skill_id=?",
+                (int(enabled), now_iso, skill_id),
+            )
+            event_row = self._insert_skill_event_locked(
+                skill_id,
+                "enabled" if enabled else "disabled",
+                source="skill_store",
+                metadata={"enabled": enabled},
+            )
+            payload = self._skill_record_payload_from_db_locked(
+                skill_id,
+                "enabled" if enabled else "disabled",
+            )
+            self._conn.commit()
+            return True, event_row, payload
+
     async def record_analysis(
         self,
         analysis: ExecutionAnalysis,
@@ -1134,11 +1461,17 @@ class SkillStore:
         ``skill_tool_deps`` together with LLM-reported ``tool_issues`` so tool
         degradation can find affected skills later.
         """
-        await asyncio.to_thread(
+        trust_updates = await asyncio.to_thread(
             self._record_analysis_sync,
             analysis,
             list(observed_tool_keys or []),
         )
+        for update in trust_updates or []:
+            for row in update.get("events", []):
+                await self._emit_evidence("skill_event", row)
+            payload = update.get("record_payload")
+            if payload:
+                await self._emit_evidence("skill_record", payload)
 
     async def evolve_skill(
         self,
@@ -1229,7 +1562,7 @@ class SkillStore:
         self,
         analysis: ExecutionAnalysis,
         observed_tool_keys: Iterable[str],
-    ) -> None:
+    ) -> List[Dict[str, Any]]:
         """Persist an analysis and update skill quality counters.
 
         ``SkillJudgment.skill_id`` is the **true skill_id** (e.g.
@@ -1241,10 +1574,11 @@ class SkillStore:
         ambiguity.
         """
         self._ensure_open()
+        trust_updates: List[Dict[str, Any]] = []
         with self._mu:
             self._conn.execute("BEGIN")
             try:
-                analysis_id = self._insert_analysis(analysis)
+                self._insert_analysis(analysis)
 
                 now_iso = datetime.now().isoformat()
                 phase_failed_ids = set(
@@ -1308,6 +1642,23 @@ class SkillStore:
                                 "task_completed": bool(analysis.task_completed),
                             },
                         )
+                    trust_outcome = ""
+                    if completed:
+                        trust_outcome = "success"
+                    elif j.skill_id in phase_failed_ids:
+                        trust_outcome = "failure"
+                    if trust_outcome:
+                        update = self._record_trust_observation_locked(
+                            skill_id=j.skill_id,
+                            observation_id=f"task:{analysis.task_id}",
+                            outcome=trust_outcome,
+                            task_id=analysis.task_id,
+                            session_id="",
+                            source="execution_analysis",
+                            evidence_refs=[f"analysis:{analysis.task_id}"],
+                        )
+                        if update.get("record") is not None:
+                            trust_updates.append(update)
 
                 self._backfill_tool_deps_from_analysis_locked(
                     analysis,
@@ -1315,6 +1666,7 @@ class SkillStore:
                 )
 
                 self._conn.commit()
+                return trust_updates
             except Exception:
                 self._conn.rollback()
                 raise
@@ -1673,6 +2025,33 @@ class SkillStore:
             return events
 
     @_db_retry()
+    def load_trust_observations(
+        self,
+        skill_id: str,
+        *,
+        limit: int = 200,
+    ) -> List[Dict[str, Any]]:
+        """Load auditable trust observations for one stable skill id."""
+
+        with self._reader() as conn:
+            rows = conn.execute(
+                "SELECT * FROM skill_trust_observations WHERE skill_id=? "
+                "ORDER BY id DESC LIMIT ?",
+                (skill_id, max(1, int(limit or 200))),
+            ).fetchall()
+            observations: List[Dict[str, Any]] = []
+            for row in reversed(rows):
+                item = dict(row)
+                try:
+                    item["evidence_refs"] = json.loads(
+                        item.pop("evidence_refs_json", "[]") or "[]"
+                    )
+                except Exception:
+                    item["evidence_refs"] = []
+                observations.append(item)
+            return observations
+
+    @_db_retry()
     def load_evolution_candidates(
         self, limit: int = 50
     ) -> List[ExecutionAnalysis]:
@@ -1741,6 +2120,7 @@ class SkillStore:
             rows = conn.execute(
                 f"""
                 SELECT sr.skill_id, sr.name, sr.description, sr.category, sr.is_active,
+                       sr.enabled, sr.trust_state,
                        sr.visibility, sr.creator_id,
                        sr.lineage_origin, sr.lineage_generation,
                        sr.total_selections, sr.total_applied,
@@ -1751,6 +2131,8 @@ class SkillStore:
                        COALESCE(ev.total_applied_events, 0) AS total_applied_events,
                        COALESCE(ev.total_completed_events, 0) AS total_completed_events,
                        COALESCE(ev.total_fallback_events, 0) AS total_fallback_events,
+                       COALESCE(tr.trust_successes, 0) AS trust_successes,
+                       COALESCE(tr.trust_failures, 0) AS trust_failures,
                        MAX(sr.total_selections, COALESCE(ev.total_invoked_events, 0))
                            AS total_uses,
                        sr.first_seen, sr.last_updated
@@ -1772,6 +2154,15 @@ class SkillStore:
                     FROM skill_events
                     GROUP BY skill_id
                 ) ev ON ev.skill_id = sr.skill_id
+                LEFT JOIN (
+                    SELECT skill_id,
+                           SUM(CASE WHEN outcome='success' THEN 1 ELSE 0 END)
+                               AS trust_successes,
+                           SUM(CASE WHEN outcome='failure' THEN 1 ELSE 0 END)
+                               AS trust_failures
+                    FROM skill_trust_observations
+                    GROUP BY skill_id
+                ) tr ON tr.skill_id = sr.skill_id
                 {where}
                 ORDER BY sr.last_updated DESC
                 """
@@ -1799,6 +2190,13 @@ class SkillStore:
                 for r in conn.execute(
                     f"SELECT lineage_origin, COUNT(*) AS cnt "
                     f"FROM skill_records{where} GROUP BY lineage_origin"
+                ).fetchall()
+            }
+            by_trust_state = {
+                r["trust_state"]: r["cnt"]
+                for r in conn.execute(
+                    f"SELECT trust_state, COUNT(*) AS cnt "
+                    f"FROM skill_records{where} GROUP BY trust_state"
                 ).fetchall()
             }
             n_analyses = conn.execute(
@@ -1849,6 +2247,7 @@ class SkillStore:
                 "total_skills_all": total_all,
                 "by_category": by_category,
                 "by_origin": by_origin,
+                "by_trust_state": by_trust_state,
                 "total_analyses": n_analyses,
                 "evolution_candidates": n_candidates,
                 "total_selections": agg["sel"] or 0,
@@ -2139,7 +2538,8 @@ class SkillStore:
         self._conn.execute(
             """
             INSERT INTO skill_records (
-                skill_id, name, description, path, is_active, category,
+                skill_id, name, description, path, is_active, enabled,
+                trust_state, category,
                 visibility, creator_id,
                 lineage_origin, lineage_revision_id, lineage_generation,
                 lineage_parent_revision_ids_json, lineage_source_task_id,
@@ -2151,12 +2551,14 @@ class SkillStore:
                 total_selections, total_applied,
                 total_completions, total_fallbacks,
                 first_seen, last_updated
-            ) VALUES (?,?,?,?,?,?, ?,?, ?,?,?,?, ?,?,?,?, ?,?,?,?, ?,?, ?,?,?,?, ?,?)
+            ) VALUES (?,?,?,?,?,?,?, ?, ?,?, ?,?,?,?, ?,?,?,?, ?,?,?,?, ?,?, ?,?,?,?, ?,?)
             ON CONFLICT(skill_id) DO UPDATE SET
                 name=excluded.name,
                 description=excluded.description,
                 path=excluded.path,
                 is_active=excluded.is_active,
+                enabled=excluded.enabled,
+                trust_state=excluded.trust_state,
                 category=excluded.category,
                 visibility=excluded.visibility,
                 creator_id=excluded.creator_id,
@@ -2186,6 +2588,8 @@ class SkillStore:
                 record.description,
                 record.path,
                 int(record.is_active),
+                int(record.enabled),
+                record.trust_state.value,
                 record.category.value,
                 record.visibility.value,
                 record.creator_id,
@@ -2386,6 +2790,15 @@ class SkillStore:
             "WHERE skill_id=? AND event_type='invoked'",
             (sid,),
         ).fetchone()[0]
+        trust_counts = conn.execute(
+            """
+            SELECT
+                SUM(CASE WHEN outcome='success' THEN 1 ELSE 0 END) AS successes,
+                SUM(CASE WHEN outcome='failure' THEN 1 ELSE 0 END) AS failures
+            FROM skill_trust_observations WHERE skill_id=?
+            """,
+            (sid,),
+        ).fetchone()
 
         return SkillRecord(
             skill_id=sid,
@@ -2393,6 +2806,8 @@ class SkillStore:
             description=row["description"],
             path=row["path"],
             is_active=bool(row["is_active"]),
+            enabled=bool(row["enabled"]),
+            trust_state=SkillTrustState(row["trust_state"]),
             category=SkillCategory(row["category"]),
             tags=[r["tag"] for r in tag_rows],
             visibility=(
@@ -2410,6 +2825,8 @@ class SkillStore:
             total_applied=row["total_applied"],
             total_completions=row["total_completions"],
             total_fallbacks=row["total_fallbacks"],
+            trust_successes=int(trust_counts["successes"] or 0),
+            trust_failures=int(trust_counts["failures"] or 0),
             recent_analyses=[
                 self._to_analysis(conn, r) for r in reversed(analysis_rows)
             ],

@@ -28,6 +28,7 @@ from openspace.skill_engine.types import (
     SkillLineage,
     SkillOrigin,
     SkillRecord,
+    SkillTrustState,
 )
 from .audit import EvolutionActionRecord
 from .behavior_eval import (
@@ -141,7 +142,6 @@ class EvolutionEngine:
                     status="completed_noop",
                     decisions=decisions,
                 )
-                await self._record_candidate_recheck_result(job, None, mode, result)
                 return result
 
             decisions = list(await self._decide(packet, job))
@@ -151,7 +151,6 @@ class EvolutionEngine:
                     status="completed_noop",
                     decisions=[],
                 )
-                await self._record_candidate_recheck_result(job, packet, mode, result)
                 return result
 
             for decision in decisions:
@@ -235,10 +234,6 @@ class EvolutionEngine:
                         or commit_status
                     )
                     errors.append(f"commit {commit_status}: {reason}")
-                elif commit_succeeded:
-                    candidates.extend(
-                        await self._mark_promoted_candidates(job, packet, action)
-                    )
                 skill_record = _extract_skill_record(action)
                 if skill_record is not None:
                     evolved.append(skill_record)
@@ -254,7 +249,6 @@ class EvolutionEngine:
                 evolved_skill_records=evolved,
                 errors=errors,
             )
-            await self._record_candidate_recheck_result(job, packet, mode, result)
             return result
         except Exception as exc:
             logger.debug("EvolutionEngine job failed: %s", job_id, exc_info=True)
@@ -270,7 +264,6 @@ class EvolutionEngine:
                 evolved_skill_records=evolved,
                 errors=errors,
             )
-            await self._record_candidate_recheck_result(job, packet, mode, result)
             return result
 
     async def _build_packet_result(self, job: Any) -> Any:
@@ -399,78 +392,6 @@ class EvolutionEngine:
                 )
             return await _maybe_await(store(decision, admission, job, reason))
         return None
-
-    async def _mark_promoted_candidates(
-        self,
-        job: Any,
-        packet: Any,
-        action: Any,
-    ) -> list[Any]:
-        store = self.candidate_store
-        if store is None:
-            return []
-        action_id = _action_id(action)
-        if not action_id:
-            return []
-        candidate_ids = _explicit_promoted_candidate_ids(job, action)
-        if not candidate_ids:
-            return []
-        marker = getattr(store, "mark_promoted", None)
-        if not callable(marker):
-            return []
-
-        promoted: list[Any] = []
-        for candidate_id in candidate_ids:
-            try:
-                promoted_candidate = await _maybe_await(
-                    marker(candidate_id, action_id, commit_succeeded=True)
-                )
-            except Exception:
-                logger.debug(
-                    "Failed to mark evolution candidate promoted: %s",
-                    candidate_id,
-                    exc_info=True,
-                )
-                continue
-            if promoted_candidate is not None:
-                promoted.append(promoted_candidate)
-        return promoted
-
-    async def _record_candidate_recheck_result(
-        self,
-        job: Any,
-        packet: Any | None,
-        mode: str,
-        result: EvolutionRunResult,
-    ) -> None:
-        if str(getattr(job, "trigger_type", "") or "").upper() != "CANDIDATE_RECHECK":
-            return
-        store = self.candidate_store
-        recorder = getattr(store, "record_recheck_result", None)
-        if store is None or not callable(recorder):
-            return
-        candidate_ids = _explicit_candidate_ids_from_job(job)
-        if not candidate_ids:
-            return
-        payload = _candidate_recheck_result_payload(result, mode=mode)
-        blocked_reason = _candidate_recheck_blocked_reason(result, mode=mode)
-        needed_evidence = _candidate_recheck_needed_evidence(result)
-        for candidate_id in candidate_ids:
-            try:
-                await _maybe_await(
-                    recorder(
-                        candidate_id,
-                        result=payload,
-                        blocked_reason=blocked_reason,
-                        needed_evidence=needed_evidence,
-                    )
-                )
-            except Exception:
-                logger.debug(
-                    "Failed to record candidate recheck result: %s",
-                    candidate_id,
-                    exc_info=True,
-                )
 
     async def _author_validate_commit(
         self,
@@ -909,6 +830,41 @@ class EvolutionCommitter:
                 )
             else:
                 await _maybe_await(self.skill_store.save_record(new_record))
+            if action_type in {"DERIVED", "CAPTURED"}:
+                record_trust = getattr(
+                    self.skill_store,
+                    "record_trust_observation",
+                    None,
+                )
+                if callable(record_trust):
+                    source_task_id = _packet_scope_value(action_packet, "task_id")
+                    observation_id = (
+                        f"task:{source_task_id}"
+                        if source_task_id
+                        else f"action:{action.action_id}"
+                    )
+                    try:
+                        observed_record = await _maybe_await(
+                            record_trust(
+                                new_record.skill_id,
+                                observation_id,
+                                "success",
+                                task_id=source_task_id or "",
+                                session_id=(
+                                    _packet_scope_value(action_packet, "session_id") or ""
+                                ),
+                                source="evolution_origin",
+                                evidence_refs=evidence_refs,
+                            )
+                        )
+                        if isinstance(observed_record, SkillRecord):
+                            new_record = observed_record
+                    except Exception:
+                        logger.warning(
+                            "Evolution trust origin record failed for %s",
+                            new_record.skill_id,
+                            exc_info=True,
+                        )
             store_written = True
 
             phase = "skill_id_sidecar"
@@ -1157,6 +1113,8 @@ class EvolutionCommitter:
             description=proposed_description,
             path=path,
             is_active=True,
+            enabled=True,
+            trust_state=SkillTrustState.PROVISIONAL,
             category=category,
             tags=tags,
             visibility=visibility,
@@ -1919,210 +1877,6 @@ def _commit_status(action: Any) -> str:
 def _action_id(action: Any) -> str:
     raw = getattr(action, "action_id", None) or _mapping_get(action, "action_id")
     return str(raw or "").strip()
-
-
-def _explicit_promoted_candidate_ids(job: Any, action: Any) -> list[str]:
-    ids = _explicit_candidate_ids_from_job(job)
-
-    for key in (
-        "candidate_id",
-        "consumed_candidate_id",
-        "promoted_candidate_id",
-        "evolution_candidate_id",
-    ):
-        value = str(getattr(action, key, None) or _mapping_get(action, key) or "")
-        if value:
-            ids.append(value)
-
-    for key in ("candidate_ids", "consumed_candidate_ids", "promoted_candidate_ids"):
-        ids.extend(
-            _str_list(getattr(action, key, None) or _mapping_get(action, key))
-        )
-    return _dedupe_strs(ids)
-
-
-def _explicit_candidate_ids_from_job(job: Any) -> list[str]:
-    ids: list[str] = []
-    for tag in _str_list(
-        getattr(job, "reason_tags", None) or _mapping_get(job, "reason_tags")
-    ):
-        if tag.startswith("candidate_id:"):
-            ids.append(tag.split(":", 1)[1])
-    return _dedupe_strs(ids)
-
-
-def _candidate_ids_from_job_and_packet(job: Any, packet: Any) -> list[str]:
-    del packet
-    return _explicit_candidate_ids_from_job(job)
-
-
-def _candidate_recheck_result_payload(
-    result: EvolutionRunResult,
-    *,
-    mode: str,
-) -> dict[str, Any]:
-    return {
-        "job_id": result.job_id,
-        "run_status": result.status,
-        "mode": mode,
-        "decision_ids": [
-            str(_attr(item, "decision_id") or "")
-            for item in result.decisions
-            if _attr(item, "decision_id")
-        ],
-        "admission_ids": [
-            str(_attr(item, "admission_id") or "")
-            for item in result.admissions
-            if _attr(item, "admission_id")
-        ],
-        "admission_outcomes": [
-            str(_attr(item, "outcome") or "")
-            for item in result.admissions
-            if _attr(item, "outcome")
-        ],
-        "candidate_ids": [
-            str(_attr(item, "candidate_id") or "")
-            for item in result.candidates
-            if _attr(item, "candidate_id")
-        ],
-        "action_ids": [
-            str(_attr(item, "action_id") or "")
-            for item in result.actions
-            if _attr(item, "action_id")
-        ],
-        "action_statuses": [
-            str(_attr(item, "commit_status") or "")
-            for item in result.actions
-            if _attr(item, "commit_status")
-        ],
-        "behavior_eval_ids": [
-            str(_attr(item, "eval_id") or "")
-            for item in result.behavior_evals
-            if _attr(item, "eval_id")
-        ],
-        "behavior_eval_outcomes": [
-            str(_attr(item, "outcome") or "")
-            for item in result.behavior_evals
-            if _attr(item, "outcome")
-        ],
-        "errors": [str(item) for item in result.errors],
-        "checked_at": datetime.now(timezone.utc).isoformat(),
-    }
-
-
-def _candidate_recheck_blocked_reason(
-    result: EvolutionRunResult,
-    *,
-    mode: str,
-) -> str | None:
-    if any(_commit_status(action) in {"committed", "committed_reconciled"} for action in result.actions):
-        return None
-    if any(_commit_status(action) == "committing" for action in result.actions):
-        return "commit_needs_recovery"
-    for candidate in result.candidates:
-        reason = _none_or_str(_attr(candidate, "blocked_reason")) or _none_or_str(
-            _attr(candidate, "reason")
-        )
-        if reason:
-            return reason
-    error_reason = _candidate_recheck_error_reason(result.errors)
-    if error_reason:
-        return error_reason
-    if result.errors:
-        return "engine_failed"
-    for admission in result.admissions:
-        outcome = str(_attr(admission, "outcome") or "").lower()
-        if outcome == "candidate":
-            reason = _candidate_admission_reason(admission)
-            return reason or "admission_candidate"
-        if outcome in {"needs_human_review", "human_review"}:
-            return "needs_human_review"
-        if outcome in {"reject", "rejected"}:
-            failures = _str_list(_attr(admission, "hard_failures"))
-            return f"admission_rejected:{failures[0]}" if failures else "admission_rejected"
-        if outcome == "noop":
-            warnings = _str_list(_attr(admission, "warnings"))
-            return f"admission_noop:{warnings[0]}" if warnings else "admission_noop"
-    for decision in result.decisions:
-        if mode == "fix_only" and _decision_action_type(decision) != EvolutionType.FIX.value:
-            return "policy_blocked:fix_only_non_fix"
-    if result.status.startswith("completed"):
-        return None
-    return "no_direct_action"
-
-
-def _candidate_admission_reason(admission: Any) -> str | None:
-    tags = [
-        *_str_list(_attr(admission, "hard_failures")),
-        *_str_list(_attr(admission, "warnings")),
-    ]
-    lowered = {str(tag).lower() for tag in tags}
-    if "single_observation" in lowered:
-        return "needs_more_evidence:additional_recurrence"
-    if "no_derived_divergence" in lowered:
-        return "needs_more_evidence:derived_divergence"
-    if "reusable_boundary_uncertain" in lowered:
-        return "needs_more_evidence:reusable_boundary"
-    if "workflow_trivial_or_uncertain" in lowered:
-        return "needs_more_evidence:workflow_significance"
-    if "low_signal_capture" in lowered:
-        return "needs_more_evidence:stronger_capture_signal"
-    if "fallback_only_capture_evidence" in lowered:
-        return "needs_more_evidence:primary_execution_evidence"
-    if tags:
-        return f"admission_candidate:{str(tags[0])}"
-    return None
-
-
-def _candidate_recheck_error_reason(errors: list[Any]) -> str | None:
-    normalized = [str(error or "").strip() for error in errors if str(error or "").strip()]
-    if "missing_behavior_eval" in normalized:
-        return "missing_behavior_eval"
-    for error in normalized:
-        if error.startswith("behavior_eval_failed:"):
-            return error
-        if error in {
-            "missing_behavior_eval",
-            "missing_behavior_evaluator",
-            "missing_required_replay_runner",
-        }:
-            return error
-    return None
-
-
-def _candidate_recheck_needed_evidence(result: EvolutionRunResult) -> list[str]:
-    for candidate in result.candidates:
-        needed = _str_list(_attr(candidate, "needed_evidence"))
-        if needed:
-            return needed
-    needed: list[str] = []
-    for admission in result.admissions:
-        for tag in [
-            *_str_list(_attr(admission, "hard_failures")),
-            *_str_list(_attr(admission, "warnings")),
-        ]:
-            lower = str(tag).lower()
-            if lower == "single_observation":
-                needed.append("additional_recurrence")
-            elif lower == "no_derived_divergence":
-                needed.append("derived_divergence_evidence")
-            elif lower in {"reusable_boundary_uncertain", "workflow_trivial_or_uncertain"}:
-                needed.append("reusable_workflow_boundary_evidence")
-            elif lower == "low_signal_capture":
-                needed.append("stronger_successful_workflow_evidence")
-            elif lower == "fallback_only_capture_evidence":
-                needed.append("primary_runtime_or_transcript_evidence")
-            elif lower.startswith("missing_") or lower.startswith("missing_ref:"):
-                needed.append(str(tag))
-    for error in result.errors:
-        lower = str(error or "").strip().lower()
-        if lower == "missing_behavior_eval":
-            needed.append("behavior_eval_result")
-        elif lower == "missing_behavior_evaluator":
-            needed.append("behavior_evaluator")
-        elif lower == "missing_required_replay_runner":
-            needed.append("replay_runner")
-    return _dedupe_strs(needed)
 
 
 def _mapping_get(value: Any, key: str) -> Any:

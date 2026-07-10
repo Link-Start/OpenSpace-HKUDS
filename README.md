@@ -129,7 +129,8 @@ Know which skills actually help.
 ### 🧬 Controlled Skill Evolution
 Improve from experience without changing everything blindly.
 - ✅ **Evidence-driven updates** — Real task evidence decides when a skill should be fixed, derived, or captured.
-- ✅ **Controlled changes** — Unclear or weak signals can be held for review instead of becoming active skills.
+- ✅ **Provisional first** — New evolved skills remain reusable but provisional until real cross-task success promotes them to trusted.
+- ✅ **Independent trust** — Trust and availability are separate; a skill can be provisional or trusted while operators independently enable or disable it.
 - ✅ **Validated skills** — A skill is checked before a new version replaces the old one.
 - ✅ **Version history** — Users can see how a skill changed over time.
 
@@ -346,7 +347,7 @@ Add project skills under `.openspace/skills/<skill-name>/`. Each skill is a dire
 
 OpenSpace discovers skills from `OPENSPACE_HOST_SKILL_DIRS`, configured `skills.skill_dirs`, project roots such as `.openspace/skills`, user roots such as `~/.openspace/skills`, and finally bundled OpenSpace skills in `openspace/skills`.
 
-Each discovered skill has a `.skill_id` sidecar for stable tracking. New project or user skills can omit it; OpenSpace creates one on first discovery or upload. Keep `.skill_id` when you want a copied skill to remain the same logical skill, and remove it before first discovery when you are creating an independent skill. Cloud upload uses the local skill ID but skips `.skill_id` as a regular uploaded file.
+Each discovered skill has a `.skill_id` sidecar for stable tracking. New project or user skills can omit it; OpenSpace creates one on first discovery. Keep `.skill_id` when you want a copied skill to remain the same logical skill, and remove it before first discovery when you are creating an independent skill. Cloud upload requires the matching local SkillStore record to be `trusted`; both public and private uploads fail closed for provisional or unknown records. The local trust state is not sent to the cloud, and `.skill_id` is skipped as a regular uploaded file.
 
 All discovered skills pass `check_skill_safety` before loading. Skills with dangerous patterns, such as prompt injection or credential exfiltration, are blocked and logged.
 
@@ -356,7 +357,7 @@ All discovered skills pass `check_skill_safety` before loading. Skills with dang
 
 ```bash
 openspace-download-skill <skill_id>         # download a skill from the cloud
-openspace-upload-skill /path/to/skill/dir   # upload a skill to the cloud
+openspace-upload-skill --skill-dir /path/to/skill/dir  # upload a trusted skill
 ```
 
 ### 📊 Local Dashboard
@@ -447,7 +448,9 @@ The evolution layer answers the second question: **when should a skill change?**
 - **FIX** — Repair a broken or outdated skill.
 - **DERIVED** — Create a better or more specialized version from an existing skill.
 - **CAPTURED** — Save a new reusable workflow from a successful task.
-- **Review before activation** — Weak or unclear signals can be held back instead of replacing active skills.
+- **Provisional → trusted** — A validated evolved skill can be reused immediately as provisional; independent successful use promotes it to trusted, while an attributable failure demotes it.
+- **Separate availability** — `enabled` controls reuse independently from the two-state trust lifecycle.
+- **Audit-only candidates** — Blocked or uncertain proposals remain inspectable candidates; recurrence never auto-rechecks or promotes them into skills.
 
 **Result:** agents can adapt to real-world change without turning every signal into noisy self-modification.
 

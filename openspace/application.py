@@ -15,7 +15,12 @@ if TYPE_CHECKING:
     from openspace.services.runtime_support.cost import CostTracker
 
 from openspace.protocol import StreamEvent
-from openspace.runtime import ExecutionRequest, OpenSpaceRuntime, RuntimeEventBus
+from openspace.runtime import (
+    ExecutionRequest,
+    ExecutionResult,
+    OpenSpaceRuntime,
+    RuntimeEventBus,
+)
 from openspace.llm.effort import (
     convert_effort_value_to_level,
     parse_effort_value,
@@ -189,8 +194,8 @@ class OpenSpaceConfig:
     evolution_triggers_enabled: bool = True
     evolution_engine_enabled: bool = True
     evolution_mode: str = "autonomous"  # audit_only | fix_only | autonomous
-    evolution_allow_single_observation_capture: bool = False
-    evolution_candidate_recheck_drain_limit: int = 2
+    evolution_allow_single_observation_capture: bool = True
+    skill_trust_promotion_min_independent_successes: int = 2
     evolution_final_drain_limit: int = 0
     evolution_final_drain_rounds: int = 1
     evolution_final_drain_timeout_s: float = 0.0
@@ -304,6 +309,23 @@ class OpenSpaceConfig:
             "OPENSPACE_EVOLUTION_ALLOW_SINGLE_OBSERVATION_CAPTURE",
             self.evolution_allow_single_observation_capture,
         )
+        env_trust_successes = os.environ.get(
+            "OPENSPACE_SKILL_TRUST_PROMOTION_MIN_INDEPENDENT_SUCCESSES"
+        )
+        if env_trust_successes is not None:
+            try:
+                self.skill_trust_promotion_min_independent_successes = int(
+                    env_trust_successes
+                )
+            except ValueError:
+                raise ValueError(
+                    "OPENSPACE_SKILL_TRUST_PROMOTION_MIN_INDEPENDENT_SUCCESSES "
+                    "must be an integer"
+                ) from None
+        self.skill_trust_promotion_min_independent_successes = max(
+            1,
+            int(self.skill_trust_promotion_min_independent_successes),
+        )
         env_evolution_mode = os.environ.get("OPENSPACE_EVOLUTION_MODE")
         if env_evolution_mode:
             self.evolution_mode = env_evolution_mode
@@ -312,18 +334,6 @@ class OpenSpaceConfig:
             raise ValueError(
                 "evolution_mode must be one of: audit_only, fix_only, autonomous"
             )
-        env_recheck_limit = os.environ.get("OPENSPACE_EVOLUTION_CANDIDATE_RECHECK_DRAIN_LIMIT")
-        if env_recheck_limit is not None:
-            try:
-                self.evolution_candidate_recheck_drain_limit = int(env_recheck_limit)
-            except ValueError:
-                raise ValueError(
-                    "OPENSPACE_EVOLUTION_CANDIDATE_RECHECK_DRAIN_LIMIT must be an integer"
-                ) from None
-        self.evolution_candidate_recheck_drain_limit = max(
-            0,
-            int(self.evolution_candidate_recheck_drain_limit),
-        )
         env_final_drain_limit = os.environ.get("OPENSPACE_EVOLUTION_FINAL_DRAIN_LIMIT")
         if env_final_drain_limit is not None:
             try:

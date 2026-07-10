@@ -35,6 +35,12 @@ tests/benchmarks/*
 !tests/benchmarks/terminal_bench/
 tests/benchmarks/terminal_bench/*
 !tests/benchmarks/terminal_bench/test_openspace_harbor_agent_config.py
+!tests/skill_engine/
+tests/skill_engine/*
+!tests/skill_engine/test_skill_trust_lifecycle.py
+!tests/cloud/
+tests/cloud/*
+!tests/cloud/test_upload_trust.py
 scripts/
 
 # Local agent/project memory

@@ -23,6 +23,13 @@ class SkillVisibility(str, Enum):
     PUBLIC  = "public"   # Visible to all users on the cloud
 
 
+class SkillTrustState(str, Enum):
+    """Evidence-backed trust state for an active skill revision."""
+
+    PROVISIONAL = "provisional"
+    TRUSTED = "trusted"
+
+
 class EvolutionType(str, Enum):
     FIX      = "fix"       # Repair broken / outdated skill instructions
     DERIVED  = "derived"   # Enhance / specialize an existing skill
@@ -372,6 +379,8 @@ class SkillRecord:
     path: str = ""                           # Path to SKILL.md (shared across FIXED versions)
 
     is_active: bool = True                   # Only the latest version is active
+    enabled: bool = True                     # Disabled skills are not exposed for reuse
+    trust_state: SkillTrustState = SkillTrustState.TRUSTED
 
     # Category & tags
     category: SkillCategory = SkillCategory.WORKFLOW
@@ -396,6 +405,8 @@ class SkillRecord:
     total_applied: int = 0       # Times the skill was actually applied by the agent
     total_completions: int = 0   # Times task completed when skill was applied
     total_fallbacks: int = 0     # Times selected skill did not carry the task to completion
+    trust_successes: int = 0     # Independent successful trust observations
+    trust_failures: int = 0      # Independent attributable failure observations
 
     # Recent analysis history (rolling window of analyses involving this skill)
     recent_analyses: List[ExecutionAnalysis] = field(default_factory=list)
@@ -442,6 +453,8 @@ class SkillRecord:
             "description": self.description,
             "path": self.path,
             "is_active": self.is_active,
+            "enabled": self.enabled,
+            "trust_state": self.trust_state.value,
             "category": self.category.value,
             "tags": self.tags,
             "visibility": self.visibility.value,
@@ -454,6 +467,8 @@ class SkillRecord:
             "total_applied": self.total_applied,
             "total_completions": self.total_completions,
             "total_fallbacks": self.total_fallbacks,
+            "trust_successes": self.trust_successes,
+            "trust_failures": self.trust_failures,
             "recent_analyses": [a.to_dict() for a in self.recent_analyses],
             "first_seen": self.first_seen.isoformat(),
             "last_updated": self.last_updated.isoformat(),
@@ -467,6 +482,10 @@ class SkillRecord:
             description=data.get("description", ""),
             path=data.get("path", ""),
             is_active=data.get("is_active", True),
+            enabled=data.get("enabled", True),
+            trust_state=SkillTrustState(
+                data.get("trust_state", SkillTrustState.TRUSTED.value)
+            ),
             category=SkillCategory(data["category"]) if data.get("category") else SkillCategory.WORKFLOW,
             tags=data.get("tags", []),
             visibility=(
@@ -486,6 +505,8 @@ class SkillRecord:
             total_applied=data.get("total_applied", 0),
             total_completions=data.get("total_completions", 0),
             total_fallbacks=data.get("total_fallbacks", 0),
+            trust_successes=data.get("trust_successes", 0),
+            trust_failures=data.get("trust_failures", 0),
             first_seen=(
                 datetime.fromisoformat(data["first_seen"])
                 if data.get("first_seen") else datetime.now()

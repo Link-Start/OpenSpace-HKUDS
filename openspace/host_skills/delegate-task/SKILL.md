@@ -199,7 +199,7 @@ Only treat the skill as repaired when `status` is `fixed`. If the result is `acc
 
 ### upload_skill
 
-Upload a skill to the cloud community. For committed evolved skills, lineage metadata is pre-saved; provide `skill_dir` and `visibility`. For non-fix uploads without pre-saved placement, use `upload_skill` as a step-by-step cloud package picker before uploading. The cloud path is separate from the local `local_category_path`.
+Upload a trusted skill to the cloud community. Public and private uploads both require a matching `trusted` record in the local SkillStore; provisional and unknown skills remain local. For committed evolved skills, lineage metadata is pre-saved; provide `skill_dir` and `visibility`. For non-fix uploads without pre-saved placement, use `upload_skill` as a step-by-step cloud package picker before uploading. The cloud path is separate from the local `local_category_path`.
 
 Interactive cloud placement flow:
 
@@ -234,8 +234,9 @@ upload_skill(
 
 | Situation | Action |
 |-----------|--------|
+| Skill is provisional or missing from SkillStore | Keep it local; use it successfully until it becomes trusted |
 | Skill was originally from the cloud | Upload as `"private"` unless the user explicitly asks to share the improvement |
-| Fix/evolution is generally useful | Upload as `"private"` during testing; use `"public"` only with explicit sharing intent |
+| Trusted fix/evolution is generally useful | Upload as `"private"` during broader testing; use `"public"` only with explicit sharing intent |
 | Fix/evolution is project-specific | Upload as `"private"`, or skip |
 | User says to share | Upload with the visibility the user wants |
 
@@ -244,4 +245,5 @@ upload_skill(
 - `execute_task` may take minutes — this is expected for multi-step tasks.
 - If `execute_task` times out, first check the host's MCP timeout settings. Changing from `stdio` to HTTP (`sse` or `streamable-http`) does not remove host-side per-call time limits.
 - `upload_skill` requires a cloud API key; if it fails, the evolved skill is still saved locally.
+- `SKILL_NOT_TRUSTED`, `SKILL_TRUST_UNKNOWN`, and `SKILL_RECORD_PATH_MISMATCH` stop locally before cloud package browsing or upload.
 - After every OpenSpace call, **tell the user** what happened: task result, any evolved skills, and your upload decision.

@@ -826,6 +826,7 @@ class OpenSpaceClient:
         self,
         skill_dir: Path,
         *,
+        local_skill_store_db_path: str | Path | None = None,
         visibility: str = "private",
         origin: str = "imported",
         parent_cloud_skill_ids: Optional[List[str]] = None,
@@ -842,10 +843,24 @@ class OpenSpaceClient:
         v2 combines artifact upload and package placement in one multipart
         request. Package creation happens by sending
         ``requested_parent_package_id`` plus ``requested_new_package_segment``.
+        Local trust is verified before any cloud request and is not included in
+        the multipart payload.
         """
         from openspace.skill_engine.skill_utils import parse_frontmatter
+        from openspace.cloud.upload_trust import (
+            require_trusted_skill_for_upload_db,
+            resolve_upload_skill_store_db,
+        )
 
         skill_path = Path(skill_dir)
+        trust_db_path = resolve_upload_skill_store_db(
+            skill_path,
+            explicit_db_path=local_skill_store_db_path,
+        )
+        require_trusted_skill_for_upload_db(
+            skill_path,
+            db_path=trust_db_path,
+        )
         skill_file = skill_path / SKILL_FILENAME
         if not skill_file.exists():
             raise CloudError(f"SKILL.md not found in {skill_dir}")

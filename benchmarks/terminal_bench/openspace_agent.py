@@ -108,7 +108,8 @@ class OpenSpaceTerminalBenchAgent(BaseAgent):
         llm_max_tokens: int = 4096,
         evolution_enabled: bool | str = True,
         evolution_mode: str = "autonomous",
-        evolution_allow_single_observation_capture: bool | str = False,
+        evolution_allow_single_observation_capture: bool | str = True,
+        skill_trust_promotion_min_independent_successes: int = 2,
         evolution_routing_eval_enabled: bool | str = False,
         evolution_behavior_eval_require_replay_runner: bool | str = False,
         quality_signal_enabled: bool | str = True,
@@ -144,6 +145,10 @@ class OpenSpaceTerminalBenchAgent(BaseAgent):
         self._evolution_mode = evolution_mode
         self._evolution_allow_single_observation_capture = (
             evolution_allow_single_observation_capture
+        )
+        self._skill_trust_promotion_min_independent_successes = max(
+            1,
+            int(skill_trust_promotion_min_independent_successes),
         )
         self._evolution_routing_eval_enabled = evolution_routing_eval_enabled
         self._evolution_behavior_eval_require_replay_runner = (
@@ -229,6 +234,9 @@ class OpenSpaceTerminalBenchAgent(BaseAgent):
             "OPENSPACE_EVOLUTION_MODE": self._evolution_mode,
             "OPENSPACE_EVOLUTION_ALLOW_SINGLE_OBSERVATION_CAPTURE": _bool_env(
                 self._evolution_allow_single_observation_capture
+            ),
+            "OPENSPACE_SKILL_TRUST_PROMOTION_MIN_INDEPENDENT_SUCCESSES": str(
+                self._skill_trust_promotion_min_independent_successes
             ),
             "OPENSPACE_EVOLUTION_ROUTING_EVAL_ENABLED": _bool_env(
                 self._evolution_routing_eval_enabled
@@ -354,6 +362,9 @@ python3 -m pip install --break-system-packages -e . || python3 -m pip install -e
                     "evolution_allow_single_observation_capture": (
                         _bool_env(self._evolution_allow_single_observation_capture)
                         == "true"
+                    ),
+                    "skill_trust_promotion_min_independent_successes": (
+                        self._skill_trust_promotion_min_independent_successes
                     ),
                     "tool_retrieval_query": task_only_instruction,
                     "recording_log_dir": self._recording_log_dir,

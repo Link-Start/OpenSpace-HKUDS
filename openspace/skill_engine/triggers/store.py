@@ -20,6 +20,9 @@ logger = Logger.get_logger(__name__)
 
 _OPEN_JOB_STATUSES = ("pending", "running", "failed_retryable")
 _IDEMPOTENCY_RUN_SEPARATOR = "#run:"
+_RETIRED_CANDIDATE_RECHECK_REASON = (
+    "candidate recheck retired; evolution candidates are audit-only"
+)
 
 
 _DDL = """
@@ -111,7 +114,31 @@ class TriggerStore:
     def _init_db(self) -> None:
         with self._mu:
             self._conn.executescript(_DDL)
+            self._retire_legacy_candidate_rechecks()
             self._conn.commit()
+
+    def _retire_legacy_candidate_rechecks(self) -> None:
+        now = _utc_now()
+        self._conn.execute(
+            """
+            UPDATE trigger_jobs
+            SET status='superseded',
+                locked_at=NULL,
+                locked_by=NULL,
+                completed_at=?,
+                error=CASE
+                    WHEN error IS NULL OR error='' THEN ?
+                    ELSE error || '; ' || ?
+                END
+            WHERE trigger_type='CANDIDATE_RECHECK'
+              AND status IN ('pending', 'running', 'failed_retryable')
+            """,
+            (
+                now,
+                _RETIRED_CANDIDATE_RECHECK_REASON,
+                _RETIRED_CANDIDATE_RECHECK_REASON,
+            ),
+        )
 
     @contextmanager
     def _reader(self) -> Generator[sqlite3.Connection, None, None]:

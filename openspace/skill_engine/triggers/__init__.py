@@ -3,7 +3,6 @@
 from .engine import TriggerEngine
 from .policies import (
     AnalysisTriggerPolicy,
-    CandidateRecheckTriggerPolicy,
     ManualTriggerPolicy,
     default_policies,
     manual_profile_for_action,
@@ -14,7 +13,6 @@ from .types import ManualTriggerRequest, TriggerJob, TriggerJobSpec
 
 __all__ = [
     "AnalysisTriggerPolicy",
-    "CandidateRecheckTriggerPolicy",
     "ManualTriggerPolicy",
     "ManualTriggerRequest",
     "TriggerEngine",

@@ -74,6 +74,20 @@ PROMPT_SHELL_INLINE_RE = re.compile(r"(^|\s)!`([^`]+)`", re.MULTILINE)
 DEFAULT_PROMPT_HOOK_TIMEOUT_SECONDS = 30.0
 
 
+def _disabled_skill_ids(store: Any | None) -> set[str]:
+    if store is None:
+        return set()
+    try:
+        return {
+            str(row.get("skill_id") or "")
+            for row in store.get_summary(active_only=True)
+            if not bool(row.get("enabled", True))
+        }
+    except Exception:
+        logger.debug("Skill enabled-state lookup failed", exc_info=True)
+        return set()
+
+
 def tool_matches_name(tool: Any, name: str) -> bool:
     if getattr(tool, "name", None) == name:
         return True
@@ -262,12 +276,14 @@ class SkillListingService:
         if not has_skill_tool(tools):
             return []
 
+        disabled = _disabled_skill_ids(self._store)
         skills = [
             skill
             for skill in self._registry.list_skills()
             if (
                 not skill.disable_model_invocation
                 and _skill_visible_to_context(skill, context)
+                and skill.skill_id not in disabled
             )
         ]
         total_visible_skills = len(skills)
@@ -613,8 +629,11 @@ class SkillDiscoveryService:
                 invoked.update(record.name for record in records)
 
         candidates: list["SkillMeta"] = []
+        disabled = _disabled_skill_ids(self._store)
         for skill in self._registry.list_skills():
             if skill.disable_model_invocation:
+                continue
+            if skill.skill_id in disabled:
                 continue
             if not _skill_visible_to_context(skill, context):
                 continue
@@ -702,6 +721,10 @@ class SkillDiscoveryService:
                     "total_applied": row.get("total_applied", 0),
                     "total_completions": row.get("total_completions", 0),
                     "total_fallbacks": row.get("total_fallbacks", 0),
+                    "enabled": row.get("enabled", True),
+                    "trust_state": row.get("trust_state", "trusted"),
+                    "trust_successes": row.get("trust_successes", 0),
+                    "trust_failures": row.get("trust_failures", 0),
                 }
                 for row in rows
             }
@@ -772,6 +795,8 @@ class SkillTool(LocalTool):
         skill = self._registry.resolve_skill_for_model(skill_name)
         if skill is None:
             return f"Unknown skill: {skill_name}"
+        if skill.skill_id in _disabled_skill_ids(self._skill_store):
+            return f"Skill {skill_name} is disabled"
         if not _skill_visible_to_context(skill, self._current_context or context):
             return f"Skill {skill_name} is not available until a matching path is touched"
         if skill.disable_model_invocation:
@@ -794,6 +819,11 @@ class SkillTool(LocalTool):
             return PermissionDeny(
                 message=f"Unknown skill: {skill_name}",
                 decision_reason=DecisionReasonOther(reason="unknown skill"),
+            )
+        if meta.skill_id in _disabled_skill_ids(self._skill_store):
+            return PermissionDeny(
+                message=f"Skill {skill_name} is disabled",
+                decision_reason=DecisionReasonOther(reason="skill disabled"),
             )
         if not _skill_visible_to_context(meta, event_context):
             await _record_skill_event_for_context(

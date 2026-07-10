@@ -1,4 +1,4 @@
-"""Durable candidate store for evidence-backed skill evolution."""
+"""Durable audit candidate store for evidence-backed skill evolution."""
 
 from __future__ import annotations
 
@@ -17,7 +17,6 @@ from typing import TYPE_CHECKING, Any, Generator, Mapping
 from openspace.skill_engine.evidence.types import (
     EvidenceEvent,
     EvidencePacket,
-    EvidenceScope,
     ResourceRef,
 )
 from openspace.utils.logging import Logger
@@ -29,22 +28,13 @@ logger = Logger.get_logger(__name__)
 
 _STATUSES = {"pending", "rejected", "promoted", "superseded"}
 _RECURRENCES = {"single", "repeated", "user_explicit"}
-_OPEN_RECHECK_STATUSES = {"pending", "running", "failed_retryable"}
 _VOLATILE_TAGS = {
-    "single_observation",
+    "provisional_evolution_disabled",
     "admission_candidate",
     "fix_only_mode_non_fix",
     "low_confidence",
     "candidate",
 }
-_USER_EXPLICIT_TERMS = {
-    "manual",
-    "user_requested",
-    "user requested",
-    "explicit",
-    "capture_requested",
-}
-
 _DDL = """
 CREATE TABLE IF NOT EXISTS evolution_candidates (
     candidate_id TEXT PRIMARY KEY,
@@ -138,17 +128,13 @@ class EvolutionCandidate:
 
 
 class EvolutionCandidateStore:
-    """Long-lived proposal store between admission and authoring."""
+    """Long-lived audit store for proposals that admission did not commit."""
 
     def __init__(
         self,
         db_path: str | Path | None = None,
         *,
         evidence_store: "EvidenceStore | None" = None,
-        trigger_engine: Any | None = None,
-        trigger_store: Any | None = None,
-        recurrence_recheck_threshold: int = 2,
-        auto_recheck: bool = True,
     ) -> None:
         if evidence_store is not None:
             db_path = evidence_store.db_path
@@ -156,14 +142,6 @@ class EvolutionCandidateStore:
             raise ValueError("EvolutionCandidateStore requires db_path or evidence_store")
 
         self.evidence_store = evidence_store
-        self.trigger_engine = trigger_engine
-        self.trigger_store = trigger_store or getattr(trigger_engine, "store", None)
-        self._owns_trigger_store = False
-        self.recurrence_recheck_threshold = max(
-            2,
-            int(recurrence_recheck_threshold or 2),
-        )
-        self.auto_recheck = bool(auto_recheck)
         self._db_path = Path(db_path).expanduser().resolve()
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._mu = threading.Lock()
@@ -196,71 +174,6 @@ class EvolutionCandidateStore:
         )
         candidate = self._insert_or_merge(draft)
         self._upsert_candidate_ref(candidate, packet=packet)
-        if (
-            self.auto_recheck
-            and candidate.status == "pending"
-            and candidate.recurrence_count >= self.recurrence_recheck_threshold
-            and _candidate_auto_recheckable(candidate)
-        ):
-            try:
-                self.request_recheck(candidate.candidate_id)
-            except Exception:
-                logger.debug(
-                    "Failed to enqueue automatic candidate recheck for %s",
-                    candidate.candidate_id,
-                    exc_info=True,
-                )
-        return candidate
-
-    def record_recheck_result(
-        self,
-        candidate_id: str,
-        *,
-        result: Mapping[str, Any],
-        blocked_reason: str | None = None,
-        needed_evidence: list[str] | None = None,
-    ) -> EvolutionCandidate:
-        now = _utc_now()
-        with self._mu:
-            self._ensure_open()
-            row = self._conn.execute(
-                "SELECT * FROM evolution_candidates WHERE candidate_id=?",
-                (candidate_id,),
-            ).fetchone()
-            if row is None:
-                raise KeyError(f"Unknown evolution candidate: {candidate_id}")
-            current = _row_to_candidate(row)
-            next_blocked_reason = blocked_reason
-            next_needed_evidence = list(needed_evidence or [])
-            if current.status == "promoted":
-                next_blocked_reason = None
-                next_needed_evidence = []
-            self._conn.execute(
-                """
-                UPDATE evolution_candidates
-                SET last_recheck_result_json=?,
-                    blocked_reason=?,
-                    needed_evidence_json=?,
-                    updated_at=?
-                WHERE candidate_id=?
-                """,
-                (
-                    _json(dict(result)),
-                    next_blocked_reason,
-                    _json(next_needed_evidence),
-                    now,
-                    candidate_id,
-                ),
-            )
-            self._conn.commit()
-            updated = self._conn.execute(
-                "SELECT * FROM evolution_candidates WHERE candidate_id=?",
-                (candidate_id,),
-            ).fetchone()
-            if updated is None:
-                raise RuntimeError("candidate recheck update did not return a row")
-            candidate = _row_to_candidate(updated)
-        self._upsert_candidate_ref(candidate, packet=None)
         return candidate
 
     def load_candidate(self, candidate_id: str) -> EvolutionCandidate | None:
@@ -322,12 +235,11 @@ class EvolutionCandidateStore:
         candidate_id: str,
         status: str,
         *,
-        promoted_action_id: str | None = None,
         rejection_reason: str | None = None,
     ) -> EvolutionCandidate:
         normalized_status = _status(status)
-        if normalized_status == "promoted" and not promoted_action_id:
-            raise ValueError("promoted candidates require promoted_action_id")
+        if normalized_status not in {"rejected", "superseded"}:
+            raise ValueError("audit candidates can only be rejected or superseded")
         now = _utc_now()
         blocked_reason = None
         needed_evidence: list[str] = []
@@ -354,7 +266,7 @@ class EvolutionCandidateStore:
                 (
                     normalized_status,
                     now,
-                    promoted_action_id,
+                    None,
                     rejection_reason if normalized_status == "rejected" else None,
                     blocked_reason,
                     _json(needed_evidence),
@@ -372,26 +284,6 @@ class EvolutionCandidateStore:
         self._upsert_candidate_ref(candidate, packet=None)
         return candidate
 
-    def mark_promoted(
-        self,
-        candidate_id: str,
-        promoted_action_id: str | None,
-        *,
-        commit_succeeded: bool,
-    ) -> EvolutionCandidate:
-        if not commit_succeeded:
-            candidate = self.load_candidate(candidate_id)
-            if candidate is None:
-                raise KeyError(f"Unknown evolution candidate: {candidate_id}")
-            return candidate
-        if not promoted_action_id:
-            raise ValueError("promoted_action_id is required after commit success")
-        return self.update_candidate_status(
-            candidate_id,
-            "promoted",
-            promoted_action_id=promoted_action_id,
-        )
-
     def reject_candidate(
         self,
         candidate_id: str,
@@ -403,56 +295,10 @@ class EvolutionCandidateStore:
             rejection_reason=reason,
         )
 
-    def request_recheck(self, candidate_id: str) -> str:
-        candidate = self.load_candidate(candidate_id)
-        if candidate is None:
-            raise KeyError(f"Unknown evolution candidate: {candidate_id}")
-        if candidate.status != "pending":
-            raise ValueError("Only pending candidates can be rechecked")
-
-        existing = self._open_recheck_job_id(candidate_id)
-        if existing:
-            return existing
-
-        self._ensure_trigger_store()
-        if self.trigger_store is None:
-            raise RuntimeError("Candidate recheck requires a TriggerStore")
-
-        from openspace.skill_engine.triggers.policies import resolve_profile
-        from openspace.skill_engine.triggers.types import TriggerJobSpec
-
-        profile = resolve_profile("CANDIDATE_RECHECK", "candidate_recheck")
-        source_task_ids = tuple(candidate.source_task_ids)
-        scope = EvidenceScope(
-            session_id=_none_or_str(candidate.decision_snapshot.get("source_session_id")),
-            task_id=source_task_ids[0] if source_task_ids else None,
-            skill_ids=tuple(candidate.target_skill_ids),
-            source_task_ids=source_task_ids,
-        )
-        watermark = int(self.trigger_store.latest_manifest_watermark())
-        job = self.trigger_store.create_job(
-            TriggerJobSpec(
-                trigger_type="CANDIDATE_RECHECK",
-                reason="candidate_recheck",
-                reason_tags=[f"candidate_id:{candidate_id}"],
-                scope=scope,
-                evidence_profile=profile.evidence_profile,
-                subprofile=profile.subprofile,
-                profile_fallback=profile.profile_fallback,
-                idempotency_key=f"candidate_recheck:{candidate_id}",
-            ),
-            manifest_watermark=watermark,
-        )
-        return str(job.job_id)
-
     def close(self) -> None:
         with self._mu:
             if self._closed:
                 return
-            if self._owns_trigger_store and self.trigger_store is not None:
-                close = getattr(self.trigger_store, "close", None)
-                if callable(close):
-                    close()
             self._conn.commit()
             self._conn.close()
             self._closed = True
@@ -484,7 +330,30 @@ class EvolutionCandidateStore:
                     "needed_evidence_json": "TEXT NOT NULL DEFAULT '[]'",
                 },
             )
+            self._reconcile_recurrence_locked()
             self._conn.commit()
+
+    def _reconcile_recurrence_locked(self) -> None:
+        rows = self._conn.execute(
+            "SELECT candidate_id, source_task_ids_json, recurrence, "
+            "recurrence_count FROM evolution_candidates"
+        ).fetchall()
+        for row in rows:
+            source_task_ids = _json_list(row["source_task_ids_json"])
+            recurrence_count = max(1, len(set(source_task_ids)))
+            recurrence = str(row["recurrence"] or "single")
+            if recurrence != "user_explicit":
+                recurrence = "repeated" if recurrence_count >= 2 else "single"
+            if (
+                recurrence_count == int(row["recurrence_count"] or 1)
+                and recurrence == str(row["recurrence"] or "single")
+            ):
+                continue
+            self._conn.execute(
+                "UPDATE evolution_candidates SET recurrence=?, recurrence_count=? "
+                "WHERE candidate_id=?",
+                (recurrence, recurrence_count, row["candidate_id"]),
+            )
 
     @contextmanager
     def _reader(self) -> Generator[sqlite3.Connection, None, None]:
@@ -526,6 +395,7 @@ class EvolutionCandidateStore:
         merge_key = _merge_key(
             proposed_action=proposed_action,
             target_skill_ids=target_skill_ids,
+            semantic_identity=_candidate_semantic_identity(decision),
             reason_tags=[
                 *_str_list(_attr(decision, "reason_tags")),
                 *_str_list(_attr(admission, "warnings")),
@@ -624,15 +494,9 @@ class EvolutionCandidateStore:
         existing: EvolutionCandidate,
         draft: EvolutionCandidate,
     ) -> EvolutionCandidate:
-        existing_admission_ids = _union(
-            _snapshot_list(existing.decision_snapshot, "admission_ids"),
-            [existing.admission_id],
-        )
-        duplicate_admission = draft.admission_id in existing_admission_ids
         snapshot = _merged_snapshot(existing, draft)
-        recurrence_count = existing.recurrence_count
-        if not duplicate_admission:
-            recurrence_count += 1
+        source_task_ids = _union(existing.source_task_ids, draft.source_task_ids)
+        recurrence_count = max(1, len(source_task_ids))
         recurrence = _merged_recurrence(existing, draft, recurrence_count)
         now = _utc_now()
         merged = EvolutionCandidate(
@@ -640,7 +504,7 @@ class EvolutionCandidateStore:
             proposed_action=existing.proposed_action,
             status=existing.status,
             admission_id=draft.admission_id,
-            source_task_ids=_union(existing.source_task_ids, draft.source_task_ids),
+            source_task_ids=source_task_ids,
             target_skill_ids=_union(existing.target_skill_ids, draft.target_skill_ids),
             decision_id=draft.decision_id,
             decision_snapshot=snapshot,
@@ -800,31 +664,6 @@ class EvolutionCandidateStore:
             logger.debug("Failed to load packet %s for candidate", packet_id, exc_info=True)
             return None
 
-    def _ensure_trigger_store(self) -> None:
-        if self.trigger_store is not None:
-            return
-        if self.trigger_engine is not None:
-            self.trigger_store = getattr(self.trigger_engine, "store", None)
-            if self.trigger_store is not None:
-                return
-        from openspace.skill_engine.triggers.store import TriggerStore
-
-        if self.evidence_store is not None:
-            self.trigger_store = TriggerStore(evidence_store=self.evidence_store)
-        else:
-            self.trigger_store = TriggerStore(db_path=self._db_path)
-        self._owns_trigger_store = True
-
-    def _open_recheck_job_id(self, candidate_id: str) -> str | None:
-        self._ensure_trigger_store()
-        get_by_key = getattr(self.trigger_store, "get_by_idempotency_key", None)
-        if callable(get_by_key):
-            job = get_by_key(f"candidate_recheck:{candidate_id}")
-            status = str(getattr(job, "status", "") or "")
-            if job is not None and status in _OPEN_RECHECK_STATUSES:
-                return str(getattr(job, "job_id", "") or "")
-        return None
-
     def _ensure_open(self) -> None:
         if self._closed:
             raise RuntimeError("EvolutionCandidateStore is closed")
@@ -940,6 +779,7 @@ def _merge_key(
     *,
     proposed_action: str,
     target_skill_ids: list[str],
+    semantic_identity: str,
     reason_tags: list[str],
     packet: EvidencePacket | None,
     evidence_refs: list[str],
@@ -957,10 +797,24 @@ def _merge_key(
         f"{key}:{count}" for key, count in sorted(_ref_type_histogram(packet, evidence_refs).items())
     )
     tools = ",".join(sorted(_normalize_token(item) for item in _tool_keys_from_refs(packet, evidence_refs)))
-    parts = [action, f"skills={skills}", f"tags={tags}", f"refs={refs}"]
+    parts = [
+        action,
+        f"skills={skills}",
+        f"semantic={semantic_identity}",
+        f"tags={tags}",
+        f"refs={refs}",
+    ]
     if tools:
         parts.append(f"tool={tools}")
     return "|".join(parts)
+
+
+def _candidate_semantic_identity(decision: Any) -> str:
+    summary = " ".join(str(_attr(decision, "reason_summary") or "").split()).lower()
+    category_path = _normalize_token(_attr(decision, "local_category_path")).lower()
+    if not summary and not category_path:
+        return _normalize_token(_attr(decision, "decision_id"))
+    return _digest({"summary": summary, "category_path": category_path})[:20]
 
 
 def _ref_type_histogram(
@@ -989,8 +843,13 @@ def _tool_keys_from_refs(
     for ref in _packet_refs(packet):
         if allowed and ref.ref_id not in allowed:
             continue
-        for field in ("tool_key", "affected_tool_key", "tool_keys", "critical_tools"):
-            keys.extend(_str_list(ref.metadata.get(field)))
+        for metadata_field in (
+            "tool_key",
+            "affected_tool_key",
+            "tool_keys",
+            "critical_tools",
+        ):
+            keys.extend(_str_list(ref.metadata.get(metadata_field)))
     return list(dict.fromkeys(item for item in keys if item))
 
 
@@ -1045,19 +904,26 @@ def _is_user_explicit(
     packet: EvidencePacket | None,
     reason: str | None,
 ) -> bool:
-    text_parts = [
-        reason or "",
-        str(_attr(decision, "candidate_policy") or ""),
-        str(_attr(decision, "reason_summary") or ""),
-        " ".join(_str_list(_attr(decision, "reason_tags"))),
-        " ".join(_str_list(_attr(admission, "warnings"))),
-    ]
-    if packet is not None:
-        for ref in packet.selected_refs.get("manual_request_ref", []):
-            text_parts.append(ref.preview)
-            text_parts.append(json.dumps(ref.metadata, sort_keys=True, default=str))
-    text = " ".join(text_parts).lower()
-    return any(term in text for term in _USER_EXPLICIT_TERMS)
+    if packet is not None and packet.selected_refs.get("manual_request_ref"):
+        return True
+    if str(_attr(decision, "recurrence") or "").strip().lower() == "user_explicit":
+        return True
+    structured_values = {
+        str(reason or "").strip().lower(),
+        str(_attr(decision, "candidate_policy") or "").strip().lower(),
+        *(
+            str(tag).strip().lower()
+            for tag in _str_list(_attr(decision, "reason_tags"))
+        ),
+        *(
+            str(tag).strip().lower()
+            for tag in _str_list(_attr(admission, "warnings"))
+        ),
+    }
+    return bool(
+        structured_values
+        & {"manual", "user_explicit", "user_requested", "capture_requested"}
+    )
 
 
 def _snapshot(value: Any) -> dict[str, Any]:
@@ -1096,13 +962,6 @@ def _attr(value: Any, name: str) -> Any:
     return getattr(value, name, None)
 
 
-def _candidate_auto_recheckable(candidate: EvolutionCandidate) -> bool:
-    reason = str(candidate.blocked_reason or "")
-    if reason.startswith("policy_blocked:"):
-        return False
-    return bool(candidate.needed_evidence) or reason.startswith("admission_candidate")
-
-
 def _blocked_reason_from_inputs(
     *,
     reason: str | None,
@@ -1131,8 +990,8 @@ def _blocked_reason_from_inputs(
 
 def _candidate_warning_reason(tags: list[str]) -> str | None:
     lowered = {str(tag).lower() for tag in tags}
-    if "single_observation" in lowered:
-        return "needs_more_evidence:additional_recurrence"
+    if "provisional_evolution_disabled" in lowered:
+        return "policy_blocked:provisional_evolution_disabled"
     if "no_derived_divergence" in lowered:
         return "needs_more_evidence:derived_divergence"
     if "reusable_boundary_uncertain" in lowered:
@@ -1172,9 +1031,7 @@ def _needed_evidence_from_inputs(
     for tag in tags:
         text = str(tag).strip()
         lower = text.lower()
-        if lower == "single_observation":
-            needed.append("additional_recurrence")
-        elif lower == "no_derived_divergence":
+        if lower == "no_derived_divergence":
             needed.append("derived_divergence_evidence")
         elif lower in {"reusable_boundary_uncertain", "workflow_trivial_or_uncertain"}:
             needed.append("reusable_workflow_boundary_evidence")

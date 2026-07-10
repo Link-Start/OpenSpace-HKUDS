@@ -13,7 +13,6 @@ TRIGGER_TYPES: frozenset[str] = frozenset(
         "ANALYSIS",
         "QUALITY_SIGNAL",
         "MANUAL",
-        "CANDIDATE_RECHECK",
     }
 )
 

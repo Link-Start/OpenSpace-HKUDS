@@ -26,7 +26,7 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 
 class _MCPSafeStdout:
@@ -2480,7 +2480,11 @@ async def upload_skill(
     submitted_skill_id: str | None = None,
     content_diff: str | None = None,
 ) -> str:
-    """Upload a local skill to the cloud.
+    """Upload a trusted local skill to the cloud.
+
+    Public and private uploads both fail closed unless ``skill_dir`` resolves
+    to a matching trusted record in the active local SkillStore. Trust remains
+    local metadata and is not sent in the cloud upload request.
 
     For evolved skills from validated evolution actions, lineage
     metadata is **pre-saved** in ``.upload_meta.json``.  The bot provides:
@@ -2539,6 +2543,20 @@ async def upload_skill(
         skill_path = Path(skill_dir)
         if not (skill_path / "SKILL.md").exists():
             return _json_error(f"SKILL.md not found in {skill_dir}")
+
+        from openspace.cloud.upload_trust import (
+            SkillUploadTrustError,
+            require_trusted_skill_for_upload,
+        )
+
+        runtime_store = await _get_runtime_store(required=False)
+        try:
+            require_trusted_skill_for_upload(
+                skill_path,
+                skill_store=runtime_store,
+            )
+        except SkillUploadTrustError as exc:
+            return _json_ok(exc.to_payload())
 
         # Read pre-saved metadata (written after validated evolution commits)
         meta = await _read_upload_meta(skill_path)
@@ -2661,6 +2679,7 @@ async def upload_skill(
         result = await asyncio.to_thread(
             client.upload_skill_v2,
             skill_path,
+            local_skill_store_db_path=getattr(runtime_store, "db_path", None),
             visibility=visibility,
             origin=final_origin,
             parent_cloud_skill_ids=final_parent_cloud_ids,

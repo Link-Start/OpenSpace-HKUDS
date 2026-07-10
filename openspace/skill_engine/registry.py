@@ -1327,6 +1327,9 @@ class SkillRegistry:
             for s in available:
                 q = skill_quality.get(s.skill_id)
                 if q:
+                    if not bool(q.get("enabled", True)):
+                        filtered_out.append(s.skill_id)
+                        continue
                     selections = q.get("total_selections", 0)
                     applied = q.get("total_applied", 0)
                     completions = q.get("total_completions", 0)
@@ -1364,6 +1367,7 @@ class SkillRegistry:
         for s in available:
             q = skill_quality.get(s.skill_id) if skill_quality else None
             if q:
+                trust_label = str(q.get("trust_state") or "trusted")
                 selections = q.get("total_selections", 0)
                 applied = q.get("total_applied", 0)
                 completions = q.get("total_completions", 0)
@@ -1371,15 +1375,17 @@ class SkillRegistry:
                     rate = completions / applied
                     catalog_lines.append(
                         f"- **{s.skill_id}**: {s.description}  "
-                        f"(success {completions}/{applied} = {rate:.0%})"
+                        f"({trust_label}; success {completions}/{applied} = {rate:.0%})"
                     )
                 elif selections > 0:
                     catalog_lines.append(
                         f"- **{s.skill_id}**: {s.description}  "
-                        f"(selected {selections}x, never succeeded)"
+                        f"({trust_label}; selected {selections}x, never succeeded)"
                     )
                 else:
-                    catalog_lines.append(f"- **{s.skill_id}**: {s.description}  (new)")
+                    catalog_lines.append(
+                        f"- **{s.skill_id}**: {s.description}  ({trust_label}; new)"
+                    )
             else:
                 catalog_lines.append(f"- **{s.skill_id}**: {s.description}")
         skills_catalog = "\n".join(catalog_lines)

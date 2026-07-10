@@ -34,6 +34,7 @@ from .types import (
     SkillLineage,
     SkillOrigin,
     SkillRecord,
+    SkillTrustState,
 )
 from .patch import (
     PatchType,
@@ -434,6 +435,38 @@ class SkillEvolver:
         finally:
             reset_call_source(_src_tok)
 
+    async def _record_origin_trust(
+        self,
+        record: SkillRecord,
+        ctx: EvolutionContext,
+    ) -> None:
+        recorder = getattr(self._store, "record_trust_observation", None)
+        if not callable(recorder):
+            return
+        task_id = str(ctx.source_task_id or "")
+        observation_id = (
+            f"task:{task_id}" if task_id else f"skill-origin:{record.skill_id}"
+        )
+        try:
+            observed = await recorder(
+                record.skill_id,
+                observation_id,
+                "success",
+                task_id=task_id,
+                source="legacy_evolution_origin",
+            )
+            if isinstance(observed, SkillRecord):
+                record.trust_state = observed.trust_state
+                record.trust_successes = observed.trust_successes
+                record.trust_failures = observed.trust_failures
+                record.last_updated = observed.last_updated
+        except Exception:
+            logger.warning(
+                "Evolution trust origin record failed for %s",
+                record.skill_id,
+                exc_info=True,
+            )
+
     async def _suggest_runtime_overlays_from_analysis(
         self,
         analysis: ExecutionAnalysis,
@@ -709,6 +742,7 @@ class SkillEvolver:
             name=fixed_name,
             description=fixed_desc,
             path=parent.path,
+            trust_state=SkillTrustState.PROVISIONAL,
             category=parent.category,
             tags=list(parent.tags),
             visibility=parent.visibility,
@@ -847,6 +881,7 @@ class SkillEvolver:
             name=new_name,
             description=new_desc,
             path=str(target_dir / SKILL_FILENAME),
+            trust_state=SkillTrustState.PROVISIONAL,
             category=ctx.suggestion.category or first_parent.category,
             tags=sorted(all_tags),
             visibility=first_parent.visibility,
@@ -866,6 +901,7 @@ class SkillEvolver:
         )
 
         await self._store.evolve_skill(new_record, parent_ids)
+        await self._record_origin_trust(new_record, ctx)
 
         # Stamp skill_id sidecar so discover() uses this ID on restart
         write_skill_id(target_dir, new_id)
@@ -985,6 +1021,7 @@ class SkillEvolver:
             name=new_name,
             description=new_desc or new_name,
             path=str(target_dir / SKILL_FILENAME),
+            trust_state=SkillTrustState.PROVISIONAL,
             category=ctx.suggestion.category or SkillCategory.WORKFLOW,
             lineage=SkillLineage(
                 origin=SkillOrigin.CAPTURED,
@@ -999,6 +1036,7 @@ class SkillEvolver:
         )
 
         await self._store.save_record(new_record)
+        await self._record_origin_trust(new_record, ctx)
 
         # Stamp skill_id sidecar so discover() uses this ID on restart
         write_skill_id(target_dir, new_id)

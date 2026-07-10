@@ -79,7 +79,8 @@ Provision cloud credentials with `openspace-cloud-auth bootstrap-agent-key --ema
 | `OPENSPACE_EVOLUTION_TRIGGERS_ENABLED` | Enable durable TriggerJob creation from evidence checkpoints; set `false` to keep evidence ingest but pause trigger jobs | `true` |
 | `OPENSPACE_EVOLUTION_ENGINE_ENABLED` | Enable TriggerJob processing through decision, admission, staged authoring, validation, and commit | `true` |
 | `OPENSPACE_EVOLUTION_MODE` | Evolution mode: `audit_only` audits only, `fix_only` commits explicit direct FIX only, `autonomous` allows all validated admitted actions | `autonomous` |
-| `OPENSPACE_EVOLUTION_ALLOW_SINGLE_OBSERVATION_CAPTURE` | Allow successful non-trivial CAPTURED proposals from one execution to proceed directly instead of waiting for recurrence; useful for controlled benchmark warmup runs | `false` |
+| `OPENSPACE_EVOLUTION_ALLOW_SINGLE_OBSERVATION_CAPTURE` | Allow a validated CAPTURED proposal, and DERIVED proposal with clear divergence, to persist as a provisional skill from its origin observation. When disabled, automatic proposals remain audit-only candidates; recurrence never promotes them | `true` |
+| `OPENSPACE_SKILL_TRUST_PROMOTION_MIN_INDEPENDENT_SUCCESSES` | Independent successful observations required to promote a provisional skill to trusted; the origin task counts for CAPTURED/DERIVED | `2` |
 | `OPENSPACE_EVOLUTION_FINAL_DRAIN_LIMIT` | Number of open post-execution evolution jobs to retry before a short-lived runtime exits; `0` disables the extra drain | `0` |
 
 ## 3. Task Runtime Context Defaults

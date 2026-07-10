@@ -202,7 +202,7 @@ export interface EvolutionReviewItem {
   admission_id?: string;
   packet_id?: string;
   validation_id?: string;
-  action_kind: 'request_recheck' | 'inspect';
+  action_kind: 'inspect';
   approval_available: boolean;
   blocking_stage?: string;
   review_note?: string;
@@ -270,19 +270,6 @@ export interface EvidenceRefPreview {
   content: string;
   truncated: boolean;
   max_chars: number;
-}
-
-export interface CandidateRecheckResult {
-  operation?: string;
-  job_id: string;
-  status: string;
-  job?: EvolutionJob | null;
-  run_now: boolean;
-  engine_available: boolean;
-  recheck_status?: 'executed_committed' | 'executed_no_commit' | 'queued_recheck' | 'queued_no_engine' | 'needs_recovery';
-  recovery_required?: boolean;
-  candidate?: EvolutionCandidate | null;
-  outcomes: Array<Record<string, unknown>>;
 }
 
 export interface WorkflowSummary {

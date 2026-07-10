@@ -108,19 +108,6 @@ NO_REPRESENTATIVE_SAMPLING = RepresentativeSamplingPolicy(
     include_success_control=False,
 )
 
-CANDIDATE_RECHECK_SAMPLING = RepresentativeSamplingPolicy(
-    enabled=True,
-    ref_types=(
-        "evolution_candidate_ref",
-        "tool_incident",
-        "tool_event",
-        "tool_result",
-    ),
-    max_groups=8,
-    max_per_group=2,
-    include_success_control=True,
-)
-
 BASE_SELECTION_POLICY = SelectionPolicy(
     max_selected_refs=80,
     default_max_refs_per_type=12,
@@ -157,12 +144,6 @@ BASE_SELECTION_POLICY = SelectionPolicy(
     },
     transcript_window=DEFAULT_TRANSCRIPT_WINDOW,
     representative_sampling=NO_REPRESENTATIVE_SAMPLING,
-)
-
-CANDIDATE_RECHECK_SELECTION_POLICY = replace(
-    BASE_SELECTION_POLICY,
-    transcript_window=replace(DEFAULT_TRANSCRIPT_WINDOW, max_messages=12),
-    representative_sampling=CANDIDATE_RECHECK_SAMPLING,
 )
 
 QUALITY_SIGNAL_SELECTION_POLICY = replace(
@@ -320,39 +301,12 @@ _BASE_PROFILES: dict[str, EvidenceProfile] = {
         },
         selection_policy=BASE_SELECTION_POLICY,
     ),
-    "candidate_recheck": EvidenceProfile(
-        name="candidate_recheck",
-        subprofile="candidate_recheck",
-        required_ref_types=("evolution_candidate_ref", "decision_rationale_ref"),
-        preferred_ref_types=(
-            "runtime_snapshot",
-            "transcript_message",
-            "tool_event",
-            "tool_result",
-            "skill_record",
-            "skill_file",
-            "skill_event",
-        ),
-        supporting_ref_types=("memory_ref", "recording_ref", "compact_summary"),
-        excluded_ref_types=(),
-        max_chars=42_000,
-        expansion_rules=ANALYSIS_EXPANSION_RULES,
-        instructions={
-            **COMMON_INSTRUCTIONS,
-            "candidate_recheck": (
-                "Candidate recheck packets must include the original candidate "
-                "and decision refs plus any new recurrence refs."
-            ),
-        },
-        selection_policy=CANDIDATE_RECHECK_SELECTION_POLICY,
-    ),
 }
 
 _TRIGGER_DEFAULT_PROFILE: dict[str, str] = {
     "ANALYSIS": "analysis_current_task",
     "QUALITY_SIGNAL": "quality_signal",
     "MANUAL": "manual_capture",
-    "CANDIDATE_RECHECK": "candidate_recheck",
 }
 
 

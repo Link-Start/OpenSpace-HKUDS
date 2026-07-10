@@ -2,7 +2,6 @@ import { useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
   evolutionApi,
-  type CandidateRecheckResult,
   type EvidenceRefPreview,
   type EvolutionAction,
   type EvolutionCandidate,
@@ -40,22 +39,6 @@ function JsonPreview({ value }: { value: unknown }) {
   );
 }
 
-function candidateRecheckMessageKey(result: CandidateRecheckResult) {
-  switch (result.recheck_status) {
-    case 'needs_recovery':
-      return 'evolution.recheckNeedsRecovery';
-    case 'executed_committed':
-      return 'evolution.recheckExecutedCommitted';
-    case 'executed_no_commit':
-      return 'evolution.recheckExecutedNoCommit';
-    case 'queued_no_engine':
-      return 'evolution.recheckQueuedNoEngine';
-    case 'queued_recheck':
-    default:
-      return 'evolution.recheckQueued';
-  }
-}
-
 export default function EvolutionPage() {
   const { t } = useTranslation();
   const [jobs, setJobs] = useState<EvolutionJob[]>([]);
@@ -77,7 +60,6 @@ export default function EvolutionPage() {
   const [error, setError] = useState<string | null>(null);
   const [qualitySignalError, setQualitySignalError] = useState<string | null>(null);
   const [detailError, setDetailError] = useState<string | null>(null);
-  const [candidateNotice, setCandidateNotice] = useState<string | null>(null);
 
   const reload = async () => {
     setLoading(true);
@@ -120,7 +102,6 @@ export default function EvolutionPage() {
   const loadCandidate = async (candidate: EvolutionCandidate) => {
     setDetailLoading(true);
     setDetailError(null);
-    setCandidateNotice(null);
     setSelectedReviewItem(null);
     setSelectedJob(null);
     setSelectedQualitySignal(null);
@@ -143,7 +124,6 @@ export default function EvolutionPage() {
   const loadAction = async (actionId: string) => {
     setDetailLoading(true);
     setDetailError(null);
-    setCandidateNotice(null);
     setSelectedReviewItem(null);
     setSelectedJob(null);
     setSelectedQualitySignal(null);
@@ -162,7 +142,6 @@ export default function EvolutionPage() {
   const loadRefPreview = async (refId: string) => {
     setDetailLoading(true);
     setDetailError(null);
-    setCandidateNotice(null);
     try {
       setSelectedRef(await evolutionApi.previewEvidenceRef(refId, 2000));
     } catch (err) {
@@ -175,7 +154,6 @@ export default function EvolutionPage() {
   const loadJob = async (job: EvolutionJob) => {
     setDetailLoading(true);
     setDetailError(null);
-    setCandidateNotice(null);
     setSelectedCandidate(null);
     setSelectedReviewItem(null);
     setSelectedQualitySignal(null);
@@ -203,7 +181,6 @@ export default function EvolutionPage() {
     }
     setDetailLoading(true);
     setDetailError(null);
-    setCandidateNotice(null);
     setSelectedCandidate(null);
     setSelectedJob(null);
     setSelectedQualitySignal(null);
@@ -222,7 +199,6 @@ export default function EvolutionPage() {
   const selectQualitySignal = (signal: QualitySignalAuditRow) => {
     setDetailLoading(false);
     setDetailError(null);
-    setCandidateNotice(null);
     setSelectedCandidate(null);
     setSelectedReviewItem(null);
     setSelectedJob(null);
@@ -235,28 +211,11 @@ export default function EvolutionPage() {
   const rejectCandidate = async (candidate: EvolutionCandidate) => {
     setBusyCandidateId(candidate.candidate_id);
     setDetailError(null);
-    setCandidateNotice(null);
     try {
       const updated = await evolutionApi.rejectCandidate(candidate.candidate_id, 'manual reject from dashboard');
       setSelectedCandidate(updated);
       setSelectedReviewItem(null);
       await reload();
-    } catch (err) {
-      setDetailError(err instanceof Error ? err.message : t('evolution.failedToUpdateCandidate'));
-    } finally {
-      setBusyCandidateId(null);
-    }
-  };
-
-  const requestCandidateRecheck = async (candidate: EvolutionCandidate) => {
-    setBusyCandidateId(candidate.candidate_id);
-    setDetailError(null);
-    try {
-      const result = await evolutionApi.requestCandidateRecheck(candidate.candidate_id, true);
-      setCandidateNotice(t(candidateRecheckMessageKey(result), { jobId: result.job_id }));
-      await reload();
-      const updated = await evolutionApi.getCandidate(candidate.candidate_id);
-      setSelectedCandidate(updated);
     } catch (err) {
       setDetailError(err instanceof Error ? err.message : t('evolution.failedToUpdateCandidate'));
     } finally {
@@ -371,26 +330,9 @@ export default function EvolutionPage() {
                     >
                       {t('evolution.inspectReview')}
                     </button>
-                    {item.approval_available && item.action_kind === 'request_recheck' && item.candidate_id ? (
-                      <button
-                        type="button"
-                        className="btn-outline-ink text-xs"
-                        disabled={busyCandidateId === item.candidate_id}
-                        onClick={() => {
-                          void (async () => {
-                            const candidate = candidates.find((candidateItem) => candidateItem.candidate_id === item.candidate_id)
-                              ?? await evolutionApi.getCandidate(item.candidate_id || '');
-                            await requestCandidateRecheck(candidate);
-                          })();
-                        }}
-                      >
-                        {t('evolution.approveForRecheck')}
-                      </button>
-                    ) : (
-                      <span className="tag px-2 py-1 text-xs text-muted">
-                        {t('evolution.inspectOnly')}
-                      </span>
-                    )}
+                    <span className="tag px-2 py-1 text-xs text-muted">
+                      {t('evolution.inspectOnly')}
+                    </span>
                   </div>
                 </article>
               ))}
@@ -499,14 +441,6 @@ export default function EvolutionPage() {
                         type="button"
                         className="btn-outline-ink text-xs"
                         disabled={busyCandidateId === candidate.candidate_id}
-                        onClick={() => void requestCandidateRecheck(candidate)}
-                      >
-                        {t('evolution.requestRecheck')}
-                      </button>
-                      <button
-                        type="button"
-                        className="btn-outline-ink text-xs"
-                        disabled={busyCandidateId === candidate.candidate_id}
                         onClick={() => void rejectCandidate(candidate)}
                       >
                         {t('evolution.reject')}
@@ -526,7 +460,6 @@ export default function EvolutionPage() {
           </div>
           {detailLoading ? <div className="text-sm text-muted">{t('common.loading')}</div> : null}
           {detailError ? <div className="text-sm text-danger">{detailError}</div> : null}
-          {candidateNotice ? <div className="text-sm text-primary">{candidateNotice}</div> : null}
           {!selectedCandidate && !selectedAction && !selectedReviewItem && !selectedJob && !selectedQualitySignal ? (
             <EmptyState title={t('evolution.noSelection')} description={t('evolution.noSelectionDesc')} />
           ) : null}

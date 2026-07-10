@@ -1,6 +1,5 @@
 import apiClient from './client';
 import type {
-  CandidateRecheckResult,
   EvidenceRef,
   EvidenceRefPreview,
   EvolutionAction,
@@ -98,15 +97,6 @@ export const evolutionApi = {
     const response = await apiClient.post<EvolutionCandidate>(
       `/evolution/candidates/${encodeURIComponent(candidateId)}/reject`,
       { reason },
-    );
-    return response.data;
-  },
-
-  async requestCandidateRecheck(candidateId: string, runNow = true): Promise<CandidateRecheckResult> {
-    const response = await apiClient.post<CandidateRecheckResult>(
-      `/evolution/candidates/${encodeURIComponent(candidateId)}/request-recheck`,
-      null,
-      { params: { run_now: runNow } },
     );
     return response.data;
   },

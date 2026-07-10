@@ -4,6 +4,7 @@ import json
 import shutil
 
 from benchmarks.terminal_bench import openspace_harbor_agent
+from benchmarks.terminal_bench import openspace_agent
 from benchmarks.terminal_bench import run_benchmark
 
 
@@ -16,6 +17,21 @@ def test_harbor_agent_default_backend_scope_includes_meta_tools():
     signature = inspect.signature(openspace_harbor_agent.OpenSpaceHarborAgent)
 
     assert signature.parameters["backend_scope"].default == "shell,meta"
+
+
+def test_legacy_agent_uses_provisional_skill_defaults():
+    signature = inspect.signature(openspace_agent.OpenSpaceTerminalBenchAgent)
+
+    assert (
+        signature.parameters["evolution_allow_single_observation_capture"].default
+        is True
+    )
+    assert (
+        signature.parameters[
+            "skill_trust_promotion_min_independent_successes"
+        ].default
+        == 2
+    )
 
 
 def test_terminal_bench_prompt_mentions_blocking_task_get():
@@ -32,6 +48,16 @@ def test_visible_test_context_is_enabled_by_default():
     assert signature.parameters["bench_stop_after_checker_pass_iterations"].default == 2
     assert signature.parameters["replay_success_bootstrap_enabled"].default is False
     assert signature.parameters["replay_success_bootstrap_skip_agent"].default is True
+    assert (
+        signature.parameters["evolution_allow_single_observation_capture"].default
+        is True
+    )
+    assert (
+        signature.parameters[
+            "skill_trust_promotion_min_independent_successes"
+        ].default
+        == 2
+    )
 
 
 def test_visible_test_context_collects_checker_paths():

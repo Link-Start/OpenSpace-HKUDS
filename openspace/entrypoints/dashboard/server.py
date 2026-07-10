@@ -80,9 +80,6 @@ def create_app(
     evidence_store: EvidenceStore | None = None,
     evidence_db_path: str | Path | None = None,
     evolution_storage_root: str | Path | None = None,
-    trigger_store: TriggerStore | None = None,
-    trigger_engine: Any | None = None,
-    evolution_engine: Any | None = None,
 ) -> Flask:
     app = Flask(__name__, static_folder=None)
     resolved_skill_db_path = _resolve_skill_store_db_path(
@@ -104,15 +101,11 @@ def create_app(
             evolution_storage_root=evolution_storage_root,
         ),
     )
-    audit_trigger_store = trigger_store or getattr(trigger_engine, "store", None)
-    if audit_trigger_store is None:
-        audit_trigger_store = TriggerStore(evidence_store=audit_evidence_store)
+    migration_trigger_store = TriggerStore(evidence_store=audit_evidence_store)
+    migration_trigger_store.close()
     audit_service = EvolutionAuditService(
         audit_evidence_store,
         skill_store,
-        trigger_store=audit_trigger_store,
-        trigger_engine=trigger_engine,
-        evolution_engine=evolution_engine,
     )
 
     def get_store() -> SkillStore:
@@ -312,20 +305,6 @@ def create_app(
         except KeyError:
             abort(404, description=f"Unknown evolution candidate: {candidate_id}")
         return jsonify(payload)
-
-    @app.route(f"{API_PREFIX}/evolution/candidates/<candidate_id>/request-recheck", methods=["POST"])
-    def request_recheck_evolution_candidate(candidate_id: str) -> Any:
-        run_now = _bool_arg("run_now", True)
-        try:
-            payload = get_audit().request_candidate_recheck(
-                candidate_id,
-                run_now=run_now,
-            )
-        except KeyError:
-            abort(404, description=f"Unknown evolution candidate: {candidate_id}")
-        except ValueError as exc:
-            return jsonify({"error": str(exc)}), 409
-        return jsonify(payload), 202
 
     @app.route(f"{API_PREFIX}/evolution/actions/<action_id>", methods=["GET"])
     def evolution_action(action_id: str) -> Any:
@@ -708,6 +687,10 @@ def _build_lineage_payload(skill_id: str, store: SkillStore) -> Dict[str, Any]:
                 "created_at": record.lineage.created_at.isoformat(),
                 "visibility": record.visibility.value,
                 "is_active": record.is_active,
+                "enabled": record.enabled,
+                "trust_state": record.trust_state.value,
+                "trust_successes": record.trust_successes,
+                "trust_failures": record.trust_failures,
                 "tags": list(record.tags),
                 "score": _skill_score(record),
                 "effective_rate": round(record.effective_rate, 4),

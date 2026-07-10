@@ -2,11 +2,8 @@
 
 from __future__ import annotations
 
-import asyncio
-import inspect
 import json
 import sqlite3
-import threading
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -16,13 +13,6 @@ from openspace.skill_engine.signals.types import (
     STATUS_AGGREGATE_ONLY,
     TRIGGERABLE_EVIDENCE_STATUSES,
 )
-
-from .job_completion import (
-    completion_after_recovery,
-    completion_from_outcome,
-    outcome_has_committing_action,
-)
-
 
 EVOLUTION_ACTION_STATUSES: frozenset[str] = frozenset(
     {
@@ -76,29 +66,18 @@ class EvidenceRefAccessError(RuntimeError):
 
 
 class EvolutionAuditService:
-    """Query and intervention surface for evidence-backed evolution audit data.
-
-    The service intentionally reads audit records and enqueues follow-up trigger
-    jobs. It does not author, validate, commit, mutate active skills, or refresh
-    the registry.
-    """
+    """Query and rejection surface for evidence-backed evolution audit data."""
 
     def __init__(
         self,
         evidence_store: Any,
         skill_store: Any | None = None,
         *,
-        trigger_store: Any | None = None,
-        trigger_engine: Any | None = None,
         candidate_store: Any | None = None,
-        evolution_engine: Any | None = None,
     ) -> None:
         self.evidence_store = evidence_store
         self.skill_store = skill_store
-        self.trigger_store = trigger_store or getattr(trigger_engine, "store", None)
-        self.trigger_engine = trigger_engine
         self.candidate_store = candidate_store
-        self.evolution_engine = evolution_engine
         self._ref_read_root_skill_ids: set[str] = set()
 
     def list_jobs(
@@ -209,9 +188,9 @@ class EvolutionAuditService:
     def list_review_items(self, limit: int = _DEFAULT_LIST_LIMIT) -> list[dict[str, Any]]:
         """Return the human-facing evolution review queue.
 
-        This is a read-only aggregation used by the dashboard. Candidate review
-        is actionable from the dashboard; admission/validation human-review rows
-        are surfaced so the operator can inspect the blocked decision path.
+        Candidate, admission, and validation rows are inspect-only. Rejecting an
+        audit candidate is a separate terminal operation and never re-enters the
+        evolution engine.
         """
 
         capped_limit = _limit(limit)
@@ -236,13 +215,12 @@ class EvolutionAuditService:
                     "admission_id": str(candidate.get("admission_id") or ""),
                     "packet_id": "",
                     "validation_id": "",
-                    "action_kind": "request_recheck",
-                    "approval_available": True,
+                    "action_kind": "inspect",
+                    "approval_available": False,
                     "blocking_stage": "candidate",
                     "review_note": (
-                        "Approves this pending candidate for a CANDIDATE_RECHECK "
-                        "job. Standalone dashboards queue the job when no live "
-                        "evolution engine is attached."
+                        "Audit-only candidate. It can be inspected or rejected, "
+                        "but it never auto-promotes into a skill."
                     ),
                 }
             )
@@ -452,40 +430,6 @@ class EvolutionAuditService:
         candidate = store.reject_candidate(candidate_id, reason or "manual reject")
         return _to_dict(candidate)
 
-    def request_candidate_recheck(
-        self,
-        candidate_id: str,
-        *,
-        run_now: bool = False,
-    ) -> dict[str, Any]:
-        store = self._candidate_store()
-        request_recheck = getattr(store, "request_recheck", None)
-        if not callable(request_recheck):
-            raise RuntimeError("candidate store does not support request_recheck")
-        job_id = request_recheck(candidate_id)
-        outcomes: list[Any] = []
-        if run_now:
-            outcomes = self._run_job_now(job_id)
-        job = self.get_job(job_id)
-        candidate = store.load_candidate(candidate_id)
-        recheck_status = _recheck_status(
-            run_now=run_now,
-            engine_available=self.evolution_engine is not None,
-            outcomes=outcomes,
-        )
-        return {
-            "operation": "request_recheck",
-            "job_id": job_id,
-            "status": (job or {}).get("status", "pending"),
-            "job": job,
-            "run_now": bool(run_now),
-            "engine_available": self.evolution_engine is not None,
-            "recheck_status": recheck_status,
-            "recovery_required": _outcomes_need_recovery(outcomes),
-            "candidate": _to_dict(candidate) if candidate is not None else None,
-            "outcomes": [_outcome_summary(outcome) for outcome in outcomes],
-        }
-
     def get_action(self, action_id: str) -> dict[str, Any] | None:
         load_action = getattr(self.evidence_store, "load_action", None)
         action = load_action(action_id) if callable(load_action) else None
@@ -572,8 +516,6 @@ class EvolutionAuditService:
 
         self.candidate_store = EvolutionCandidateStore(
             evidence_store=self.evidence_store,
-            trigger_store=self.trigger_store,
-            trigger_engine=self.trigger_engine,
         )
         return self.candidate_store
 
@@ -610,83 +552,6 @@ class EvolutionAuditService:
             except Exception:
                 continue
             self._ref_read_root_skill_ids.add(skill_id)
-
-    def _run_job_now(self, job_id: str) -> list[Any]:
-        engine = self.evolution_engine
-        if engine is None:
-            return []
-
-        claimer = None
-        if self.trigger_engine is not None:
-            claimer = getattr(self.trigger_engine, "claim_jobs", None)
-        if not callable(claimer) and self.trigger_store is not None:
-            claimer = getattr(self.trigger_store, "claim_jobs", None)
-        jobs: list[Any] = []
-        if callable(claimer):
-            jobs = list(claimer([job_id], worker_id="dashboard") or [])
-        if not jobs:
-            fallback = None
-            if self.trigger_engine is not None:
-                fallback = getattr(self.trigger_engine, "claim_next", None)
-            if not callable(fallback) and self.trigger_store is not None:
-                fallback = getattr(self.trigger_store, "claim_next", None)
-            if callable(fallback):
-                jobs = list(
-                    fallback(
-                        limit=1,
-                        worker_id="dashboard",
-                        trigger_types=("CANDIDATE_RECHECK",),
-                    )
-                    or []
-                )
-                jobs = [
-                    job
-                    for job in jobs
-                    if str(getattr(job, "job_id", "") or "") == job_id
-                ]
-
-        outcomes: list[Any] = []
-        for job in jobs:
-            result = engine.process_job(job)
-            result = _resolve_awaitable_sync(result)
-            outcomes.append(result)
-            completion = completion_from_outcome(result)
-            if completion.needs_recovery:
-                recovered = self._recover_committing_actions()
-                completion = completion_after_recovery(result, recovered)
-            self._complete_run_now_job(job, result, completion=completion)
-        return outcomes
-
-    def _complete_run_now_job(
-        self,
-        job: Any,
-        outcome: Any,
-        *,
-        completion: Any | None = None,
-    ) -> Any | None:
-        complete = None
-        if self.trigger_engine is not None:
-            complete = getattr(self.trigger_engine, "complete", None)
-        if not callable(complete) and self.trigger_store is not None:
-            complete = getattr(self.trigger_store, "complete", None)
-        if not callable(complete):
-            return None
-        completion = completion or completion_from_outcome(outcome)
-        complete(
-            str(getattr(job, "job_id", "") or ""),
-            status=completion.status,
-            result_ref=completion.result_ref,
-            error=completion.error,
-        )
-        return completion
-
-    def _recover_committing_actions(self) -> list[Any]:
-        engine = self.evolution_engine
-        recover = getattr(engine, "recover_committing_actions", None)
-        if not callable(recover):
-            return []
-        result = recover()
-        return list(_resolve_awaitable_sync(result) or [])
 
     def _job_from_row(self, conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
         payload = dict(row)
@@ -1000,44 +865,6 @@ def _ids_for_values(
     return [str(row[id_column]) for row in rows if str(row[id_column])]
 
 
-def _outcome_summary(outcome: Any) -> dict[str, Any]:
-    decisions = list(getattr(outcome, "decisions", []) or [])
-    admissions = list(getattr(outcome, "admissions", []) or [])
-    candidates = list(getattr(outcome, "candidates", []) or [])
-    actions = list(getattr(outcome, "actions", []) or [])
-    evolved = list(getattr(outcome, "evolved_skill_records", []) or [])
-    return {
-        "job_id": str(getattr(outcome, "job_id", "") or ""),
-        "status": str(getattr(outcome, "status", "") or ""),
-        "decision_ids": [
-            str(getattr(item, "decision_id", "") or "")
-            for item in decisions
-            if getattr(item, "decision_id", None)
-        ],
-        "admission_ids": [
-            str(getattr(item, "admission_id", "") or "")
-            for item in admissions
-            if getattr(item, "admission_id", None)
-        ],
-        "candidate_ids": [
-            str(getattr(item, "candidate_id", "") or "")
-            for item in candidates
-            if getattr(item, "candidate_id", None)
-        ],
-        "action_ids": [
-            str(getattr(item, "action_id", "") or "")
-            for item in actions
-            if getattr(item, "action_id", None)
-        ],
-        "evolved_skill_ids": [
-            str(getattr(item, "skill_id", "") or "")
-            for item in evolved
-            if getattr(item, "skill_id", None)
-        ],
-        "errors": [str(item) for item in (getattr(outcome, "errors", []) or [])],
-    }
-
-
 def _candidate_review_summary(candidate: dict[str, Any]) -> str:
     needed = [str(item) for item in (candidate.get("needed_evidence") or []) if item]
     blocked = str(candidate.get("blocked_reason") or "").strip()
@@ -1053,44 +880,6 @@ def _review_summary(primary: list[str], secondary: list[str]) -> str:
     if not values:
         return "needs human review"
     return ", ".join(values[:3])
-
-
-def _recheck_status(
-    *,
-    run_now: bool,
-    engine_available: bool,
-    outcomes: list[Any],
-) -> str:
-    if not run_now:
-        return "queued_recheck"
-    if not engine_available:
-        return "queued_no_engine"
-    if _outcomes_need_recovery(outcomes):
-        return "needs_recovery"
-    if _outcomes_have_committed_action(outcomes):
-        return "executed_committed"
-    if outcomes:
-        return "executed_no_commit"
-    return "queued_recheck"
-
-
-def _outcomes_have_committed_action(outcomes: list[Any]) -> bool:
-    for outcome in outcomes:
-        for action in getattr(outcome, "actions", []) or []:
-            status = _field_value(action, "commit_status")
-            if str(status or "").lower() in {"committed", "committed_reconciled"}:
-                return True
-    return False
-
-
-def _outcomes_need_recovery(outcomes: list[Any]) -> bool:
-    return any(outcome_has_committing_action(outcome) for outcome in outcomes)
-
-
-def _field_value(item: Any, name: str) -> Any:
-    if isinstance(item, dict):
-        return item.get(name)
-    return getattr(item, name, None)
 
 
 def _skill_ids_from_ref(ref: Any) -> list[str]:
@@ -1151,49 +940,6 @@ def _skill_record_read_root(path: Any) -> Path:
     if resolved.name == "SKILL.md" or resolved.suffix:
         return resolved.parent
     return resolved
-
-
-def _resolve_awaitable_sync(value: Any) -> Any:
-    if not inspect.isawaitable(value):
-        return value
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        return _run_awaitable_in_new_loop(value)
-    return _run_awaitable_in_thread(value)
-
-
-async def _await_value(value: Any) -> Any:
-    return await value
-
-
-def _run_awaitable_in_thread(value: Any) -> Any:
-    result_box: dict[str, Any] = {}
-
-    def runner() -> None:
-        try:
-            result_box["value"] = _run_awaitable_in_new_loop(value)
-        except BaseException as exc:
-            result_box["error"] = exc
-
-    thread = threading.Thread(
-        target=runner,
-        name="openspace-evolution-audit-await",
-        daemon=True,
-    )
-    thread.start()
-    thread.join()
-    if "error" in result_box:
-        raise result_box["error"]
-    return result_box.get("value")
-
-
-def _run_awaitable_in_new_loop(value: Any) -> Any:
-    loop = asyncio.new_event_loop()
-    try:
-        return loop.run_until_complete(_await_value(value))
-    finally:
-        loop.close()
 
 
 def _path_from_uri(uri: Any) -> Path | None:

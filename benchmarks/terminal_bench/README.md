@@ -110,7 +110,6 @@ python -m benchmarks.terminal_bench \
   --agent-kwarg openrouter_reasoning_effort=high \
   --agent-kwarg evolution_final_drain_limit=4 \
   --agent-kwarg evolution_final_drain_timeout_s=300 \
-  --agent-kwarg evolution_allow_single_observation_capture=true \
   --agent-kwarg bench_checker_failure_guard=false \
   --harbor-max-retries 1 \
   --retry-include AgentSetupTimeoutError \
@@ -141,6 +140,14 @@ because no external runner was configured. The adapter also sets
 post-task LLM selector calls per generated skill inside the benchmark container.
 Use `--agent-kwarg evolution_routing_eval_enabled=true` when you want the full
 routing behavior check during a diagnostic run.
+Validated single-observation CAPTURED skills are persisted as `provisional` by
+default. The origin task contributes the first trust observation; one later
+independent successful use promotes the skill to `trusted` with the default
+`skill_trust_promotion_min_independent_successes=2`. Trust does not control
+availability: `enabled` remains a separate operator-controlled flag.
+Admission candidates are audit-only. Repeated candidate observations do not
+enqueue recheck jobs or produce skills; subsequent task evidence affects trust
+only after a provisional skill has been committed.
 
 The wrapper and adapter default to a lean task-solving tool surface for
 Terminal-Bench: `backend_scope=shell`, `skills_disabled=true`,

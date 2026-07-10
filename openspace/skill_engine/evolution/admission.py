@@ -106,13 +106,6 @@ _WORKFLOW_BOUNDARY_TERMS = (
     "domain",
     "stable",
 )
-_USER_EXPLICIT_TERMS = (
-    "manual",
-    "user_requested",
-    "user requested",
-    "explicit",
-    "capture_requested",
-)
 _QUALITY_SIGNAL_EXTERNAL_ATTRIBUTIONS = {
     "attribution:permission",
     "attribution:environment",
@@ -162,13 +155,11 @@ class EvolutionAdmission:
         evidence_store: Any | None = None,
         skill_store: Any | None = None,
         registry: Any | None = None,
-        recurrence_threshold: int = 2,
-        allow_single_observation_capture: bool = False,
+        allow_single_observation_capture: bool = True,
     ) -> None:
         self.evidence_store = evidence_store
         self.skill_store = skill_store
         self.registry = registry
-        self.recurrence_threshold = max(2, int(recurrence_threshold or 2))
         self.allow_single_observation_capture = bool(
             allow_single_observation_capture
         )
@@ -421,16 +412,19 @@ class EvolutionAdmission:
 
         text = _decision_text(decision)
         has_divergence = _contains_any(text, _DERIVED_DIVERGENCE_TERMS)
-        repeated_or_manual = self._is_repeated_or_user_explicit(decision, packet)
+        user_explicit = _is_user_explicit(decision, packet)
+        provisional_allowed = self.allow_single_observation_capture or user_explicit
         if not has_divergence:
             warnings.append("no_derived_divergence")
         if _contains_any(text, _BUGFIX_TERMS) and not has_divergence:
             warnings.append("bugfix_should_be_fix")
-        if not repeated_or_manual:
-            warnings.append("single_observation")
+        if not provisional_allowed:
+            warnings.append("provisional_evolution_disabled")
+        elif not user_explicit:
+            warnings.append("single_observation_allowed")
 
         outcome = "candidate"
-        if has_divergence and repeated_or_manual:
+        if has_divergence and provisional_allowed:
             outcome = "direct"
         return self._result(
             decision,
@@ -498,18 +492,16 @@ class EvolutionAdmission:
         if not _reusable_boundary(decision, packet):
             warnings.append("reusable_boundary_uncertain")
 
-        repeated_or_manual = self._is_repeated_or_user_explicit(decision, packet)
-        single_observation_allowed = (
-            self.allow_single_observation_capture and not repeated_or_manual
-        )
-        if not repeated_or_manual and not single_observation_allowed:
-            warnings.append("single_observation")
-        elif single_observation_allowed:
+        user_explicit = _is_user_explicit(decision, packet)
+        provisional_allowed = self.allow_single_observation_capture or user_explicit
+        if not provisional_allowed:
+            warnings.append("provisional_evolution_disabled")
+        elif not user_explicit:
             warnings.append("single_observation_allowed")
 
         outcome = "candidate"
         if (
-            (repeated_or_manual or single_observation_allowed)
+            provisional_allowed
             and "workflow_trivial_or_uncertain" not in warnings
             and "reusable_boundary_uncertain" not in warnings
         ):
@@ -520,13 +512,6 @@ class EvolutionAdmission:
             outcome=outcome,
             warnings=warnings,
             required_refs_checked=checked,
-        )
-
-    def _is_repeated_or_user_explicit(self, decision: Any, packet: EvidencePacket) -> bool:
-        return _is_repeated_or_user_explicit(
-            decision,
-            packet,
-            recurrence_threshold=self.recurrence_threshold,
         )
 
     def _skill_exists(self, skill_id: str, packet: EvidencePacket) -> bool:
@@ -1174,50 +1159,17 @@ def _capture_depends_on_ephemeral_context(
     return _contains_any("\n".join(parts), _CONTEXT_EPHEMERAL_CAPTURE_TERMS)
 
 
-def _is_repeated_or_user_explicit(
-    decision: Any,
-    packet: EvidencePacket,
-    *,
-    recurrence_threshold: int = 2,
-) -> bool:
-    text = _decision_text(decision)
-    if _contains_any(text, _USER_EXPLICIT_TERMS):
-        return True
+def _is_user_explicit(decision: Any, packet: EvidencePacket) -> bool:
     if _refs(packet, "manual_request_ref"):
         return True
     recurrence = str(_attr(decision, "recurrence") or "").lower()
-    if recurrence in {"repeated", "user_explicit"}:
+    if recurrence == "user_explicit":
         return True
-    tags = " ".join(_str_list(_attr(decision, "reason_tags"))).lower()
-    if any(term in tags for term in ("repeated", "recurrence", "min_observations")):
-        return True
-    threshold = max(2, int(recurrence_threshold or 2))
-    scope = getattr(packet, "scope", None)
-    source_task_ids = getattr(scope, "source_task_ids", ()) if scope is not None else ()
-    if len([item for item in source_task_ids if item]) >= threshold:
-        return True
-    representative_ids = (
-        getattr(scope, "representative_execution_ids", ())
-        if scope is not None
-        else ()
-    )
-    if len([item for item in representative_ids if item]) >= threshold:
-        return True
-    for ref in _refs(packet, "evolution_candidate_ref"):
-        metadata = getattr(ref, "metadata", {}) or {}
-        recurrence = str(metadata.get("recurrence") or "").strip().lower()
-        if recurrence in {"repeated", "user_explicit"}:
-            return True
-        try:
-            recurrence_count = int(metadata.get("recurrence_count") or 0)
-        except (TypeError, ValueError):
-            recurrence_count = 0
-        if recurrence_count >= threshold:
-            return True
-        candidate_source_task_ids = _str_list(metadata.get("source_task_ids"))
-        if len([item for item in candidate_source_task_ids if item]) >= threshold:
-            return True
-    return False
+    tags = {
+        str(tag).strip().lower()
+        for tag in _str_list(_attr(decision, "reason_tags"))
+    }
+    return bool(tags & {"user_explicit", "user_requested", "manual"})
 
 
 def _existing_skill_covers(decision: Any) -> bool:

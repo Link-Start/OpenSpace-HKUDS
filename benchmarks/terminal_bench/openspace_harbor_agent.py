@@ -966,7 +966,8 @@ class OpenSpaceHarborAgent(BaseAgent):
         evolution_startup_retryable_drain_timeout_s: int = 0,
         evolution_startup_retryable_drain_statuses: str = "failed_retryable",
         evolution_recovery_stale_job_timeout_s: int = 1800,
-        evolution_allow_single_observation_capture: bool | str = False,
+        evolution_allow_single_observation_capture: bool | str = True,
+        skill_trust_promotion_min_independent_successes: int = 2,
         evolution_routing_eval_enabled: bool | str = False,
         evolution_behavior_eval_require_replay_runner: bool | str = False,
         quality_signal_enabled: bool | str = True,
@@ -1067,6 +1068,10 @@ class OpenSpaceHarborAgent(BaseAgent):
         )
         self._evolution_allow_single_observation_capture = (
             evolution_allow_single_observation_capture
+        )
+        self._skill_trust_promotion_min_independent_successes = max(
+            1,
+            int(skill_trust_promotion_min_independent_successes),
         )
         self._evolution_routing_eval_enabled = evolution_routing_eval_enabled
         self._evolution_behavior_eval_require_replay_runner = (
@@ -1310,6 +1315,9 @@ class OpenSpaceHarborAgent(BaseAgent):
             "OPENSPACE_EVOLUTION_MODE": self._evolution_mode,
             "OPENSPACE_EVOLUTION_ALLOW_SINGLE_OBSERVATION_CAPTURE": _bool_env(
                 self._evolution_allow_single_observation_capture
+            ),
+            "OPENSPACE_SKILL_TRUST_PROMOTION_MIN_INDEPENDENT_SUCCESSES": str(
+                self._skill_trust_promotion_min_independent_successes
             ),
             "OPENSPACE_EVOLUTION_ROUTING_EVAL_ENABLED": _bool_env(
                 self._evolution_routing_eval_enabled
@@ -2079,6 +2087,9 @@ fi
                         _bool_env(self._evolution_allow_single_observation_capture)
                         == "true"
                     ),
+                    "skill_trust_promotion_min_independent_successes": (
+                        self._skill_trust_promotion_min_independent_successes
+                    ),
                     "evolution_routing_eval_enabled": (
                         _bool_env(self._evolution_routing_eval_enabled) == "true"
                     ),
@@ -2239,6 +2250,9 @@ exit $status
             "evolution_allow_single_observation_capture": (
                 _bool_env(self._evolution_allow_single_observation_capture) == "true"
             ),
+            "skill_trust_promotion_min_independent_successes": (
+                self._skill_trust_promotion_min_independent_successes
+            ),
             "evolution_routing_eval_enabled": (
                 _bool_env(self._evolution_routing_eval_enabled) == "true"
             ),
@@ -2356,6 +2370,9 @@ exit $status
             "evolution_mode": self._evolution_mode,
             "evolution_allow_single_observation_capture": (
                 _bool_env(self._evolution_allow_single_observation_capture) == "true"
+            ),
+            "skill_trust_promotion_min_independent_successes": (
+                self._skill_trust_promotion_min_independent_successes
             ),
             "evolution_routing_eval_enabled": (
                 _bool_env(self._evolution_routing_eval_enabled) == "true"

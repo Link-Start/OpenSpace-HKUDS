@@ -134,7 +134,8 @@ OpenSpace v2 给 Agent 四项实际能力：
 从经验中改进，但不是盲目地什么都改。
 
 - ✅ **证据驱动更新** — 真实任务证据决定一个 Skill 应该被修复、派生，还是捕获为新 Skill。
-- ✅ **受控变更** — 不清楚或较弱的信号可以先保留审阅，而不是直接变成生效 Skill。
+- ✅ **先 provisional** — 新演化出的 Skill 可以复用，但会保持 provisional，直到真实的跨任务成功将其晋级为 trusted。
+- ✅ **信任与可用性分离** — Skill 可以是 provisional 或 trusted，操作者仍可独立启用或禁用它。
 - ✅ **验证后的 Skill** — 新版本替换旧版本之前会先被检查。
 - ✅ **版本历史** — 用户可以看到一个 Skill 如何随时间变化。
 
@@ -359,7 +360,7 @@ openspace --model "anthropic/claude-sonnet-4-5" --query "Create a monitoring das
 
 OpenSpace 会依次发现 `OPENSPACE_HOST_SKILL_DIRS`、配置里的 `skills.skill_dirs`、项目级目录（例如 `.openspace/skills`）、用户级目录（例如 `~/.openspace/skills`），最后才加载 `openspace/skills` 中随 OpenSpace 发布的内置 Skill。
 
-每个被发现的 Skill 都有一个 `.skill_id` sidecar，用于稳定追踪。新的项目级或用户级 Skill 可以先不包含它；OpenSpace 会在首次发现或上传时创建。复制 Skill 且希望保持同一个逻辑 Skill 时，请保留 `.skill_id`；如果是在创建新的独立 Skill，请在首次发现前删除它。云端上传会使用本地 Skill ID，但不会把 `.skill_id` 当作普通文件上传。
+每个被发现的 Skill 都有一个 `.skill_id` sidecar，用于稳定追踪。新的项目级或用户级 Skill 可以先不包含它；OpenSpace 会在首次发现时创建。复制 Skill 且希望保持同一个逻辑 Skill 时，请保留 `.skill_id`；如果是在创建新的独立 Skill，请在首次发现前删除它。公开和私有云端上传都要求对应的本地 SkillStore 记录为 `trusted`；`provisional` 或状态未知时会在本地 fail closed。trust 状态不会发送到云端，`.skill_id` 也不会作为普通文件上传。
 
 所有发现到的 Skill 在加载前都会经过 `check_skill_safety`。包含危险模式的 Skill，例如 prompt injection 或凭证外泄，会被阻断并记录日志。
 
@@ -369,7 +370,7 @@ OpenSpace 会依次发现 `OPENSPACE_HOST_SKILL_DIRS`、配置里的 `skills.ski
 
 ```bash
 openspace-download-skill <skill_id>         # 从云端下载 Skill
-openspace-upload-skill /path/to/skill/dir   # 上传 Skill 到云端
+openspace-upload-skill --skill-dir /path/to/skill/dir  # 上传 trusted Skill
 ```
 
 ### 📊 本地仪表盘
@@ -460,7 +461,9 @@ OpenSpace v2 有四个相互连接的层。它们对应前面的问题：判断 
 - **FIX** — 修复损坏或过时的 Skill。
 - **DERIVED** — 从已有 Skill 创建更好或更专门的版本。
 - **CAPTURED** — 从成功任务中保存新的可复用工作流。
-- **生效前审阅** — 较弱或不清晰的信号可以先保留，而不是直接替换生效 Skill。
+- **provisional → trusted** — 通过验证的 evolved Skill 会先以 provisional 状态参与复用；独立的成功使用会将其晋级为 trusted，可归因失败则使其降级。
+- **可用性独立** — `enabled` 独立控制是否参与复用，不与两态 trust 生命周期混在一起。
+- **candidate 仅用于审计** — 被阻止或不确定的 proposal 会保留为可查看的 candidate；recurrence 不会自动触发复审或将其晋级为 Skill。
 
 **结果**：Agent 可以适应真实世界变化，但不会把每个信号都变成噪音式自我修改。
 

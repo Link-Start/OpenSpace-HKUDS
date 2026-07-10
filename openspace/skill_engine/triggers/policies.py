@@ -174,53 +174,6 @@ class ManualTriggerPolicy:
         ]
 
 
-class CandidateRecheckTriggerPolicy:
-    trigger_type = "CANDIDATE_RECHECK"
-
-    def on_event(
-        self,
-        event: EvidenceEvent,
-        manifest_watermark: int,
-    ) -> list[TriggerJobSpec]:
-        return []
-
-    def evaluate_checkpoint(
-        self,
-        name: str,
-        scope: EvidenceScope,
-        manifest_watermark: int,
-    ) -> list[TriggerJobSpec]:
-        if name != "candidate_recheck":
-            return []
-        profile = resolve_profile("CANDIDATE_RECHECK", "candidate_recheck")
-        return [
-            TriggerJobSpec(
-                trigger_type="CANDIDATE_RECHECK",
-                reason="candidate_recheck",
-                reason_tags=[],
-                scope=scope,
-                evidence_profile=profile.evidence_profile,
-                subprofile=profile.subprofile,
-                profile_fallback=profile.profile_fallback,
-                idempotency_key=f"candidate_recheck:{_digest(scope.to_dict())}:{manifest_watermark}",
-            )
-        ]
-
-    def evaluate_window(
-        self,
-        now: datetime,
-        manifest_watermark: int,
-    ) -> list[TriggerJobSpec]:
-        return []
-
-    def from_manual_request(
-        self,
-        request: ManualTriggerRequest,
-        manifest_watermark: int,
-    ) -> list[TriggerJobSpec]:
-        return []
-
-
 class _Profile:
     def __init__(
         self,
@@ -238,7 +191,6 @@ def resolve_profile(trigger_type: str, reason: str) -> _Profile:
         ("ANALYSIS", "task_finished"): ("analysis_current_task", "task_finished"),
         ("QUALITY_SIGNAL", "tool_failure_affects_skill"): ("quality_signal", "tool_failure_affects_skill"),
         ("QUALITY_SIGNAL", "tool_semantic_issue"): ("quality_signal", "tool_semantic_issue"),
-        ("CANDIDATE_RECHECK", "candidate_recheck"): ("candidate_recheck", "candidate_recheck"),
     }
     if (trigger_type, reason) in known:
         profile, subprofile = known[(trigger_type, reason)]
@@ -247,7 +199,6 @@ def resolve_profile(trigger_type: str, reason: str) -> _Profile:
         "ANALYSIS": "analysis_current_task",
         "QUALITY_SIGNAL": "quality_signal",
         "MANUAL": "manual",
-        "CANDIDATE_RECHECK": "candidate_recheck",
     }
     return _Profile(defaults.get(trigger_type, "unknown"), "default", True)
 
@@ -266,7 +217,6 @@ def default_policies(evidence_store: EvidenceStore | None = None) -> list[Trigge
     return [
         AnalysisTriggerPolicy(evidence_store),
         ManualTriggerPolicy(),
-        CandidateRecheckTriggerPolicy(),
     ]
 
 

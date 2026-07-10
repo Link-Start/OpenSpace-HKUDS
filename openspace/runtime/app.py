@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 import os
 import sys
 from collections.abc import Callable
@@ -570,7 +569,6 @@ class OpenSpaceRuntime:
                         )
                     self.state.candidate_store = EvolutionCandidateStore(
                         evidence_store=self.state.evidence_store,
-                        trigger_engine=self.state.trigger_engine,
                     )
                     replay_command = getattr(config, "evolution_replay_command", None)
                     replay_docker_image = getattr(
@@ -653,7 +651,7 @@ class OpenSpaceRuntime:
                         allow_single_observation_capture=getattr(
                             config,
                             "evolution_allow_single_observation_capture",
-                            False,
+                            True,
                         ),
                     ),
                     candidate_store=self.state.candidate_store,
@@ -807,7 +805,14 @@ class OpenSpaceRuntime:
                             config,
                             self.state.evolution_storage_root,
                         )
-                        skill_store = SkillStore(skill_store_db_path)
+                        skill_store = SkillStore(
+                            skill_store_db_path,
+                            trust_promotion_min_independent_successes=getattr(
+                                config,
+                                "skill_trust_promotion_min_independent_successes",
+                                2,
+                            ),
+                        )
                         self.state.skill_store = skill_store
                         admission_policy = None
                         if self.state.evolution_engine is not None:
@@ -1969,12 +1974,6 @@ class OpenSpaceRuntime:
                 task_evolved_skills.append(
                     self.evolved_skill_record_from_evolution(record)
                 )
-        candidate_outcomes = await self.maybe_drain_candidate_rechecks()
-        for outcome in candidate_outcomes:
-            for record in getattr(outcome, "evolved_skill_records", []) or []:
-                task_evolved_skills.append(
-                    self.evolved_skill_record_from_evolution(record)
-                )
         final_outcomes = await self.maybe_drain_final_evolution_jobs(
             task_id=task_id,
             session_id=session_id,
@@ -2232,31 +2231,6 @@ class OpenSpaceRuntime:
                 exc_info=True,
             )
             return []
-
-    async def maybe_drain_candidate_rechecks(self) -> list[Any]:
-        """Opportunistically consume queued candidate rechecks at runtime checkpoints."""
-
-        limit = int(
-            getattr(self.config, "evolution_candidate_recheck_drain_limit", 0)
-            or 0
-        )
-        if limit <= 0 or not self._candidate_recheck_cutover_enabled():
-            return []
-        return await self.drain_evolution_jobs(
-            trigger_types=("CANDIDATE_RECHECK",),
-            limit=limit,
-        )
-
-    def _candidate_recheck_cutover_enabled(self) -> bool:
-        """Allow queued candidates to re-enter eval-capable modes."""
-
-        evolution_engine = self.state.evolution_engine
-        mode = str(
-            getattr(evolution_engine, "evolution_mode", None)
-            or getattr(self.config, "evolution_mode", "autonomous")
-            or "autonomous"
-        ).strip().lower()
-        return mode in {"autonomous", "fix_only"} and self._quality_cutover_enabled()
 
     def schedule_post_execution_tasks(
         self,
@@ -2758,6 +2732,10 @@ class OpenSpaceRuntime:
             "description": rec.description,
             "path": str(rec.path) if rec.path else "",
             "origin": rec.lineage.origin.value,
+            "trust_state": rec.trust_state.value,
+            "enabled": bool(rec.enabled),
+            "trust_successes": rec.trust_successes,
+            "trust_failures": rec.trust_failures,
             "generation": rec.lineage.generation,
             "parent_local_skill_ids": rec.lineage.parent_skill_ids,
             "change_summary": rec.lineage.change_summary,

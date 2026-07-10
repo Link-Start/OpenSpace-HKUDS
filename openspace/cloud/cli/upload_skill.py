@@ -18,6 +18,11 @@ from pathlib import Path
 from openspace.cloud.client import OpenSpaceClient
 from openspace.cloud.config import load_cloud_config, normalize_cloud_base_url
 from openspace.cloud.package_placement import PackagePlacementResolver
+from openspace.cloud.upload_trust import (
+    SkillUploadTrustError,
+    require_trusted_skill_for_upload_db,
+    resolve_upload_skill_store_db,
+)
 
 
 def main() -> None:
@@ -41,6 +46,14 @@ def main() -> None:
     parser.add_argument("--owner-agent-id", default=None, help="v2 owner agent UUID override; normally omitted")
     parser.add_argument("--submitted-skill-id", default=None, help="v2 submitted skill id override")
     parser.add_argument("--content-diff-file", default=None, help="v2 content_diff text file override")
+    parser.add_argument(
+        "--skill-store-db-path",
+        default=None,
+        help=(
+            "Local SkillStore DB used to verify trusted state; defaults to "
+            "OPENSPACE_SKILL_STORE_DB_PATH or the nearest .openspace/openspace.db"
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true", help="List files without uploading")
 
     args = parser.parse_args()
@@ -56,6 +69,19 @@ def main() -> None:
         for f in files:
             print(f"  {f.relative_to(skill_dir)}", file=sys.stderr)
         sys.exit(0)
+
+    skill_store_db = resolve_upload_skill_store_db(
+        skill_dir,
+        explicit_db_path=args.skill_store_db_path,
+    )
+    try:
+        require_trusted_skill_for_upload_db(
+            skill_dir,
+            db_path=skill_store_db,
+        )
+    except SkillUploadTrustError as exc:
+        print(f"ERROR [{exc.code}]: {exc}", file=sys.stderr)
+        sys.exit(1)
 
     parent_cloud_ids = [p.strip() for p in args.parent_cloud_ids.split(",") if p.strip()]
     try:
@@ -95,6 +121,7 @@ def main() -> None:
             content_diff = Path(args.content_diff_file).read_text(encoding="utf-8")
         result = client.upload_skill_v2(
             skill_dir,
+            local_skill_store_db_path=skill_store_db,
             visibility=args.visibility,
             origin=args.origin,
             parent_cloud_skill_ids=parent_cloud_ids,
@@ -107,7 +134,7 @@ def main() -> None:
         print(f"ERROR: {e}", file=sys.stderr)
         sys.exit(1)
 
-    print(f"\nUpload complete!", file=sys.stderr)
+    print("\nUpload complete!", file=sys.stderr)
     print(json.dumps(result, indent=2, ensure_ascii=False))
 
 

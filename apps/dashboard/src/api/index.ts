@@ -4,7 +4,6 @@ export { overviewApi } from './overview';
 export { skillsApi } from './skills';
 export { workflowsApi } from './workflows';
 export type {
-  CandidateRecheckResult,
   EvidenceRef,
   EvidenceRefPreview,
   ExecutionAnalysis,
