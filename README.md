@@ -6,7 +6,7 @@
 
 ## OpenSpace: The Quality-First Skill Hub for AI Agents
 
-| 📊 **Real-Task Validated** | 🧬 **Evidence-Driven Evolution** | 🌐 **Hierarchical Skill Hub** | 🛠️ **End-to-End Quality Records** |
+| 📊 **Real-Task Validated** | 🌐 **Hierarchical Skill Hub** | 🧬 **Evidence-Driven Evolution** | 🛠️ **End2End Quality Records** |
 
 [![Agents](https://img.shields.io/badge/Agents-Claude_Code%20%7C%20Codex%20%7C%20OpenClaw%20%7C%20...-99C9BF.svg)](https://modelcontextprotocol.io/)
 [![Python](https://img.shields.io/badge/Python-3.12+-FCE7D6.svg)](https://www.python.org/)
@@ -16,7 +16,7 @@
 [![中文文档](https://img.shields.io/badge/文档-中文版-F5C6C6?style=flat)](./README_zh.md)
 [![v1 README](https://img.shields.io/badge/v1-README-EDEDED?style=flat)](https://github.com/HKUDS/OpenSpace/blob/main/README.md)
 
-**One Command to Evolve All Your AI Agents**: OpenClaw, nanobot, Claude Code, Codex, Cursor and etc.
+**Your Universal Skill Hub for All AI Agents** — Claude Code, Codex, OpenClaw, Hermès, nanobot.
 
 <img src="assets/cli-typing.gif" width="500px" alt="openspace --query your task">
 
