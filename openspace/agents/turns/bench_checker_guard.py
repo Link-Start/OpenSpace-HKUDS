@@ -179,6 +179,13 @@ def update_from_tool_turn(
         elif verdict == "passed":
             state.bench_visible_checker_failed = False
             state.bench_visible_checker_pass_iteration = state.current_iteration
+        elif _stales_prior_checker_pass(
+            state,
+            command=command,
+            content=content,
+            status=status,
+        ):
+            state.bench_visible_checker_pass_iteration = None
 
 
 def _message_status(message: dict[str, Any]) -> str:
@@ -346,6 +353,54 @@ def _looks_like_inspection_only(command: str) -> bool:
         if not _INSPECTION_COMMAND_RE.search(segment):
             return False
     return saw_segment
+
+
+def _looks_like_mutating_command(command: str) -> bool:
+    command = command.strip()
+    if not command:
+        return False
+    if re.search(
+        r"(?ix)"
+        r"^\s*(?:write|edit|create(?:[-_]?file)?|apply_patch|touch|mkdir|"
+        r"cp|mv|rm|chmod|chown|ln|install)\b",
+        command,
+    ):
+        return True
+    if re.search(
+        r"(?ix)"
+        r"("
+        r"\b(?:cat|tee|python(?:3)?|node|perl|ruby|awk|sed)\b[^;&|]*(?:>|>>)|"
+        r"\bsed\s+-i\b|"
+        r"\bpython(?:3)?\s+-c\b[^;&|]*(?:open\s*\(|Path\s*\(|write_text|"
+        r"write_bytes)|"
+        r"\b(?:pip|python(?:3)?\s+-m\s+pip|uv|npm|pnpm|yarn|cargo|go)\s+"
+        r"(?:install|add|build|run|test)\b"
+        r")",
+        command,
+    ):
+        return True
+    return False
+
+
+def _stales_prior_checker_pass(
+    state: Any,
+    *,
+    command: str,
+    content: str,
+    status: str,
+) -> bool:
+    pass_iteration = getattr(state, "bench_visible_checker_pass_iteration", None)
+    if pass_iteration is None:
+        return False
+    if _looks_like_checker(command, content):
+        return False
+    if _looks_like_mutating_command(command):
+        return True
+    if _looks_like_inspection_only(command):
+        return False
+    if status in {"error", "failed", "denied", "cancelled"}:
+        return True
+    return bool(_FAILURE_RE.search(content))
 
 
 def _failure_excerpt(content: str) -> str:

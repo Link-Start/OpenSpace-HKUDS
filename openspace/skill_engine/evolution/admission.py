@@ -1201,7 +1201,23 @@ def _is_repeated_or_user_explicit(
         if scope is not None
         else ()
     )
-    return len([item for item in representative_ids if item]) >= threshold
+    if len([item for item in representative_ids if item]) >= threshold:
+        return True
+    for ref in _refs(packet, "evolution_candidate_ref"):
+        metadata = getattr(ref, "metadata", {}) or {}
+        recurrence = str(metadata.get("recurrence") or "").strip().lower()
+        if recurrence in {"repeated", "user_explicit"}:
+            return True
+        try:
+            recurrence_count = int(metadata.get("recurrence_count") or 0)
+        except (TypeError, ValueError):
+            recurrence_count = 0
+        if recurrence_count >= threshold:
+            return True
+        candidate_source_task_ids = _str_list(metadata.get("source_task_ids"))
+        if len([item for item in candidate_source_task_ids if item]) >= threshold:
+            return True
+    return False
 
 
 def _existing_skill_covers(decision: Any) -> bool:

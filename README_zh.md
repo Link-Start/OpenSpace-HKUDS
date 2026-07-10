@@ -1,7 +1,7 @@
 <div align="center">
 
 <picture>
-    <img src="assets/logo_version_2.png" width="180px" style="border: none; box-shadow: none;" alt="OpenSpace Logo">
+    <img src="assets/logo_v2.png" width="280px" style="border: none; box-shadow: none;" alt="OpenSpace Logo">
 </picture>
 
 ## OpenSpace：面向 Agent 的 Skill Hub - 质量优先，而非数量堆积

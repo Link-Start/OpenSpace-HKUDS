@@ -22,6 +22,19 @@ Desktop.ini
 # Development-only repository folders
 docs/
 tests/
+!tests/
+tests/*
+!tests/agents/
+tests/agents/*
+!tests/agents/turns/
+tests/agents/turns/*
+!tests/agents/turns/test_bench_checker_guard.py
+!tests/agents/turns/test_model_call_controller_bench_guards.py
+!tests/benchmarks/
+tests/benchmarks/*
+!tests/benchmarks/terminal_bench/
+tests/benchmarks/terminal_bench/*
+!tests/benchmarks/terminal_bench/test_openspace_harbor_agent_config.py
 scripts/
 
 # Local agent/project memory
@@ -53,6 +66,12 @@ benchmarks/gdpval/ref_cache/
 
 # Terminal-Bench benchmark harness is not part of this release
 benchmarks/terminal_bench/
+!benchmarks/terminal_bench/
+!benchmarks/terminal_bench/*.py
+!benchmarks/terminal_bench/**/*.py
+benchmarks/terminal_bench/runs/
+benchmarks/terminal_bench/datasets/
+benchmarks/terminal_bench/logs/
 
 # Embedding cache - root level fully ignored
 /.openspace/
