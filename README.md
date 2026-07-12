@@ -26,7 +26,7 @@
 
 ## 📢 News
 
-- **2026-07-09** 🚀 **OpenSpace v2 is released**: v2 turns OpenSpace into a quality-first Skill Hub with package-based skill browsing, skill quality summaries, task-trace evidence upload, and a refreshed dashboard / TUI experience.
+- **2026-07-09** 🚀 **OpenSpace v2 is released**: v2 turns OpenSpace into a quality-first Skill Hub with package-based skill browsing, skill quality summaries, task-trace uploads, and a refreshed dashboard / TUI experience.
 
 - **2026-07-04** 📊 **Skill quality summaries now visible while browsing v2 skills**: package and skill detail views show usage-quality summaries; public lineage pages display redacted placeholders for unavailable private content.
 
