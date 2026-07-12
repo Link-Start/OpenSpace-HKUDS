@@ -24,6 +24,17 @@
 
 ---
 
+## Why OpenSpace?
+Your agent can already run tasks. But can it remember which skills worked? Can it stop repeating the same mistakes? Can your team share what it learned?
+
+**🌐 One Skill Hub for every agent** — Whether you run OpenClaw, nanobot, Claude Code, Codex, or Cursor, OpenSpace gives all of them a shared place to browse, import, and reuse skills. Stop rebuilding the same experience from scratch in every tool.
+
+**🔒 A private skill platform your org actually owns** — Deploy OpenSpace inside your own infrastructure. Your workflows stay internal, your data never leaves, and every skill your agents learn becomes a compounding asset — not a black box on someone else's server.
+
+**📈 Agents that get better with every run** — OpenSpace tracks real task outcomes to evolve skills that work, retire ones that do not, and distill experience into leaner, sharper prompts — so your agent improves over time and spends fewer tokens getting there.
+
+---
+
 ## 📢 News
 
 - **2026-07-09** 🚀 **OpenSpace v2 is released**: v2 turns OpenSpace into a quality-first Skill Hub with package-based skill browsing, skill quality summaries, task-trace uploads, and a refreshed dashboard / TUI experience.
