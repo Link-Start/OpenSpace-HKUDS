@@ -26,11 +26,11 @@
 
 ## 📢 News
 
-- **2026-07-09** 🚀 **OpenSpace v2 is released**: v2 turns OpenSpace into a quality-first Skill Hub with package-based skill browsing, skill quality summaries, task-trace evidence upload, and a refreshed local dashboard / TUI experience.
+- **2026-07-09** 🚀 **OpenSpace v2 is released**: v2 turns OpenSpace into a quality-first Skill Hub with package-based skill browsing, skill quality summaries, task-trace evidence upload, and a refreshed dashboard / TUI experience.
 
-- **2026-07-04** 📊 **Skill quality summaries are now visible while browsing v2 skills**: package and skill detail views can show usage-quality summaries, and public lineage pages use redacted placeholders when private content is unavailable.
+- **2026-07-04** 📊 **Skill quality summaries now visible while browsing v2 skills**: package and skill detail views show usage-quality summaries; public lineage pages display redacted placeholders for unavailable private content.
 
-- **2026-07-03** 🔎 **Package skill search and task-trace uploads became first-class v2 flows**: package pages can search skills directly, and task traces can be validated, stored, and uploaded idempotently as quality evidence.
+- **2026-07-03** 🔎 **Package skill search and task-trace uploads are now first-class v2 flows**: package pages search skills directly, and task traces can be validated, stored, and uploaded idempotently as quality evidence.
 
 - **2026-06-25** 🌐 **The v2 cloud path became more stable for public browsing and private skill access**: public pages, private skill endpoints, frontend / backend routes, and TLS access are now checked together.
 
