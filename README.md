@@ -27,11 +27,27 @@
 ## Why OpenSpace?
 Your agent can already run tasks. But can it remember which skills worked? Can it stop repeating the same mistakes? Can your team share what it learned?
 
-**🌐 One Skill Hub for every agent** — Whether you run OpenClaw, nanobot, Claude Code, Codex, or Cursor, OpenSpace gives all of them a shared place to browse, import, and reuse skills. Stop rebuilding the same experience from scratch in every tool.
-
-**🔒 A private skill platform your org actually owns** — Deploy OpenSpace inside your own infrastructure. Your workflows stay internal, your data never leaves, and every skill your agents learn becomes a compounding asset — not a black box on someone else's server.
-
-**📈 Agents that get better with every run** — OpenSpace tracks real task outcomes to evolve skills that work, retire ones that do not, and distill experience into leaner, sharper prompts — so your agent improves over time and spends fewer tokens getting there.
+<table>
+  <tr>
+    <td width="33.33%" align="center"><img src="assets/feat_1.png" alt="One Skill Hub for every agent" width="100%"></td>
+    <td width="33.33%" align="center"><img src="assets/feat_2.png" alt="A private skill platform your org actually owns" width="100%"></td>
+    <td width="33.33%" align="center"><img src="assets/feat_3.png" alt="Agents that get better with every run" width="100%"></td>
+  </tr>
+  <tr>
+    <td width="33.33%" valign="top">
+      <p align="center"><strong>🌐 One Skill Hub for every agent</strong></p>
+      <p>Whether you run OpenClaw, nanobot, Claude Code, Codex, or Cursor, OpenSpace gives all of them a shared place to browse, import, and reuse skills. Stop rebuilding the same experience from scratch in every tool.</p>
+    </td>
+    <td width="33.33%" valign="top">
+      <p align="center"><strong>🔒 A private skill platform your org actually owns</strong></p>
+      <p>Deploy OpenSpace inside your own infrastructure. Your workflows stay internal, your data never leaves, and every skill your agents learn becomes a compounding asset — not a black box on someone else's server.</p>
+    </td>
+    <td width="33.33%" valign="top">
+      <p align="center"><strong>📈 Agents that get better with every run</strong></p>
+      <p>OpenSpace tracks real task outcomes to evolve skills that work, retire ones that do not, and distill experience into leaner, sharper prompts — so your agent improves over time and spends fewer tokens getting there.</p>
+    </td>
+  </tr>
+</table>
 
 ---
 
